@@ -71,7 +71,8 @@ fn test_lock_and_bridge_and_fee_calculation() {
     let target_chain: u32 = 1;
     let metadata_cid = soroban_sdk::String::from_str(&env, "QmTestCID123");
 
-    let bridge_id = bridge.lock_and_bridge(&1u64, &owner, &metadata_cid, &target_chain, &notional_value);
+    let bridge_id =
+        bridge.lock_and_bridge(&1u64, &owner, &metadata_cid, &target_chain, &notional_value);
 
     assert_eq!(bridge_id, 1);
 
@@ -115,7 +116,8 @@ fn test_m_of_n_approvals_and_unwrap_flow() {
     let notional_value: i128 = 50_000;
     let target_chain: u32 = 2;
     let metadata_cid = soroban_sdk::String::from_str(&env, "QmTestCID123");
-    let bridge_id = bridge.lock_and_bridge(&2u64, &owner, &metadata_cid, &target_chain, &notional_value);
+    let bridge_id =
+        bridge.lock_and_bridge(&2u64, &owner, &metadata_cid, &target_chain, &notional_value);
 
     // Outbound approvals
     bridge.approve_outbound(&signer1, &bridge_id);
@@ -168,7 +170,8 @@ fn test_bridge_expiration() {
     let notional_value: i128 = 10_000;
     let target_chain: u32 = 3;
     let metadata_cid = soroban_sdk::String::from_str(&env, "QmTestCID123");
-    let bridge_id = bridge.lock_and_bridge(&3u64, &owner, &metadata_cid, &target_chain, &notional_value);
+    let bridge_id =
+        bridge.lock_and_bridge(&3u64, &owner, &metadata_cid, &target_chain, &notional_value);
 
     // Move time forward beyond expiration
     let now = env.ledger().timestamp();

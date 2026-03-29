@@ -151,7 +151,7 @@ impl PredictionMarket {
     ) {
         // Placeholder implementation - would update agent reputation
         env.events().publish(
-            (Symbol::new(env, "reputation_updated"),),
+            (Symbol::new(&env, "reputation_updated"),),
             (agent, amount, reason as u32),
         );
     }

@@ -12,9 +12,7 @@ mod prop_tests {
     use crate::{ExecutionHub, ExecutionHubClient};
     use proptest::prelude::*;
     use soroban_sdk::{
-        contract, contractimpl,
-        testutils::Address as _,
-        Address, Bytes, Env, String,
+        contract, contractimpl, testutils::Address as _, Address, Bytes, Env, String,
     };
 
     // ── minimal mock AgentNFT ─────────────────────────────────────────────────
@@ -48,7 +46,13 @@ mod prop_tests {
         (client, admin, nft)
     }
 
-    fn exec(env: &Env, client: &ExecutionHubClient, agent_id: u64, executor: &Address, nonce: u64) -> u64 {
+    fn exec(
+        env: &Env,
+        client: &ExecutionHubClient,
+        agent_id: u64,
+        executor: &Address,
+        nonce: u64,
+    ) -> u64 {
         let action = String::from_str(env, "act");
         let params = Bytes::from_array(env, &[1u8]);
         let hash = Bytes::from_array(env, &nonce.to_be_bytes());
@@ -135,25 +139,6 @@ mod prop_tests {
             prop_assert!(result.is_err(), "execution #{nonce} must be rate-limited");
         }
 
-        // ── EH-4b  rate limit: 101st call in same window is blocked (fast) ───
-        #[test]
-        fn prop_rate_limit_101st_blocked(_dummy in 0..1u32) {
-            let env = Env::default();
-            let (client, _, nft) = setup(&env);
-            let executor = Address::generate(&env);
-            nft.set_owner(&1u64, &executor);
-
-            for i in 1..=100u64 {
-                exec(&env, &client, 1, &executor, i);
-            }
-
-            let action = String::from_str(&env, "act");
-            let params = Bytes::from_array(&env, &[1u8]);
-            let hash = Bytes::from_array(&env, &101u64.to_be_bytes());
-            let result = client.try_execute_action(&1u64, &executor, &action, &params, &101u64, &hash);
-            prop_assert!(result.is_err(), "101st execution must be rate-limited");
-        }
-
         // ── EH-5  action count matches executions ─────────────────────────────
 
         #[test]
@@ -191,5 +176,24 @@ mod prop_tests {
             prop_assert_eq!(receipt_before.execution_hash, receipt_after.execution_hash);
             prop_assert_eq!(receipt_before.timestamp, receipt_after.timestamp);
         }
+    }
+
+    // ── EH-4b  rate limit: 101st call in same window is blocked (fast) ───────
+    #[test]
+    #[should_panic(expected = "Rate limit exceeded")]
+    fn prop_rate_limit_101st_blocked() {
+        let env = Env::default();
+        let (client, _, nft) = setup(&env);
+        let executor = Address::generate(&env);
+        nft.set_owner(&1u64, &executor);
+
+        for i in 1..=100u64 {
+            exec(&env, &client, 1, &executor, i);
+        }
+
+        let action = String::from_str(&env, "act");
+        let params = Bytes::from_array(&env, &[1u8]);
+        let hash = Bytes::from_array(&env, &101u64.to_be_bytes());
+        client.execute_action(&1u64, &executor, &action, &params, &101u64, &hash);
     }
 }

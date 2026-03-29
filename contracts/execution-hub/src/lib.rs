@@ -1,17 +1,16 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, IntoVal, String,
-    Symbol, Vec, Map,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, IntoVal, Map, String,
+    Symbol, Vec,
 };
 #[cfg(test)]
 mod prop_tests;
 use stellai_lib::{
-    admin, errors::ContractError, storage_keys::EXEC_CTR_KEY, validation, ADMIN_KEY,
-    DEFAULT_RATE_LIMIT_OPERATIONS, DEFAULT_RATE_LIMIT_WINDOW_SECONDS, MAX_DATA_SIZE,
+    admin, errors::ContractError, storage_keys::EXEC_CTR_KEY, validation, AnomalyScore,
+    AnomalySeverity, BehaviorProfile, ProposalStatus, ThresholdKeyShare, ThresholdProposal,
+    ADMIN_KEY, DEFAULT_RATE_LIMIT_OPERATIONS, DEFAULT_RATE_LIMIT_WINDOW_SECONDS, MAX_DATA_SIZE,
     MAX_HISTORY_QUERY_LIMIT, MAX_HISTORY_SIZE, MAX_STRING_LENGTH,
-    BehaviorProfile, AnomalyScore, AnomalySeverity,
-    ThresholdKeyShare, ThresholdProposal, ProposalStatus,
 };
 
 #[derive(Clone)]
@@ -805,28 +804,28 @@ impl ExecutionHub {
         // Shift operations_per_hour if time advanced
         if elapsed_hours > 0 {
             let mut slots_to_shift = elapsed_hours as u32;
-                if slots_to_shift >= 24 {
-                    // reset
-                    let mut newv = Vec::new(&env);
-                    for _ in 0..24 {
-                        newv.push_back(0u32);
-                    }
-                    profile.operations_per_hour = newv;
-                } else {
-                    // rotate left and zero-fill latest slots
-                    let mut newv = Vec::new(&env);
-                    for _ in 0..24 {
-                        newv.push_back(0u32);
-                    }
-                    let mut idx = 0u32;
-                    for i in slots_to_shift..24 {
-                        if let Some(val) = profile.operations_per_hour.get(idx) {
-                            newv.push_back(val);
-                        }
-                        idx += 1;
-                    }
-                    profile.operations_per_hour = newv;
+            if slots_to_shift >= 24 {
+                // reset
+                let mut newv = Vec::new(&env);
+                for _ in 0..24 {
+                    newv.push_back(0u32);
                 }
+                profile.operations_per_hour = newv;
+            } else {
+                // rotate left and zero-fill latest slots
+                let mut newv = Vec::new(&env);
+                for _ in 0..24 {
+                    newv.push_back(0u32);
+                }
+                let mut idx = 0u32;
+                for i in slots_to_shift..24 {
+                    if let Some(val) = profile.operations_per_hour.get(idx) {
+                        newv.push_back(val);
+                    }
+                    idx += 1;
+                }
+                profile.operations_per_hour = newv;
+            }
         }
 
         // Increment current hour count
@@ -840,7 +839,8 @@ impl ExecutionHub {
         // Update running average execution cost (learning window up to 100)
         if profile.learning_count < 100 {
             let lc = profile.learning_count as i128;
-            profile.avg_execution_cost = ((profile.avg_execution_cost * lc) + execution_cost) / (lc + 1);
+            profile.avg_execution_cost =
+                ((profile.avg_execution_cost * lc) + execution_cost) / (lc + 1);
             profile.learning_count += 1;
         } else {
             // simple EWMA decay
@@ -863,7 +863,11 @@ impl ExecutionHub {
             weights_sum += weight;
             count += 1;
         }
-        let mean = if weights_sum > 0 { sum / weights_sum } else { 0 };
+        let mean = if weights_sum > 0 {
+            sum / weights_sum
+        } else {
+            0
+        };
 
         // variance
         let mut var_sum: i128 = 0;
@@ -874,7 +878,11 @@ impl ExecutionHub {
             let diff = val - mean;
             var_sum += w * diff * diff;
         }
-        let variance = if weights_sum > 0 { var_sum / weights_sum } else { 0 };
+        let variance = if weights_sum > 0 {
+            var_sum / weights_sum
+        } else {
+            0
+        };
 
         // integer sqrt for stddev
         fn isqrt(mut x: i128) -> i128 {
@@ -893,16 +901,36 @@ impl ExecutionHub {
         let stddev = isqrt(variance);
 
         // Frequency z (scaled by 100): abs(current - mean) *100 / (stddev +1)
-        let current = profile.operations_per_hour.get(profile.operations_per_hour.len().saturating_sub(1)).unwrap_or(0u32) as i128;
+        let current = profile
+            .operations_per_hour
+            .get(profile.operations_per_hour.len().saturating_sub(1))
+            .unwrap_or(0u32) as i128;
         let freq_z_bp = if stddev > 0 {
-            ((if current > mean { current - mean } else { mean - current }) * 100) / (stddev + 1)
+            ((if current > mean {
+                current - mean
+            } else {
+                mean - current
+            }) * 100)
+                / (stddev + 1)
         } else {
-            ((if current > mean { current - mean } else { mean - current }) * 100)
+            ((if current > mean {
+                current - mean
+            } else {
+                mean - current
+            }) * 100)
         };
 
         // Cost z: deviation relative to cost std (approx as 10% of avg or 1)
-        let cost_std = if profile.avg_execution_cost.abs() / 10 > 0 { profile.avg_execution_cost.abs() / 10 } else { 1 };
-        let cost_dev = if execution_cost > profile.avg_execution_cost { execution_cost - profile.avg_execution_cost } else { profile.avg_execution_cost - execution_cost };
+        let cost_std = if profile.avg_execution_cost.abs() / 10 > 0 {
+            profile.avg_execution_cost.abs() / 10
+        } else {
+            1
+        };
+        let cost_dev = if execution_cost > profile.avg_execution_cost {
+            execution_cost - profile.avg_execution_cost
+        } else {
+            profile.avg_execution_cost - execution_cost
+        };
         let cost_z_bp = (cost_dev * 100) / (cost_std + 1);
 
         // Combine signals: 70% freq, 30% cost
@@ -913,7 +941,13 @@ impl ExecutionHub {
 
         if combined_bp > threshold_bp {
             // determine severity
-            let severity = if combined_bp >= 1000 { AnomalySeverity::High } else if combined_bp >= 500 { AnomalySeverity::Medium } else { AnomalySeverity::Low };
+            let severity = if combined_bp >= 1000 {
+                AnomalySeverity::High
+            } else if combined_bp >= 500 {
+                AnomalySeverity::Medium
+            } else {
+                AnomalySeverity::Low
+            };
             let reason = String::from_str(env, "behavioral anomaly detected");
             let score = AnomalyScore {
                 score: combined_bp,
@@ -922,7 +956,10 @@ impl ExecutionHub {
             };
 
             // emit event
-            env.events().publish((symbol_short!("anom"),), (agent_id, combined_bp, severity as u32));
+            env.events().publish(
+                (symbol_short!("anom"),),
+                (agent_id, combined_bp, severity as u32),
+            );
 
             // Apply adaptive rate limits: Medium -> 50%, High -> 10%
             let mut effective = Self::get_effective_rate_limit(env, agent_id);
@@ -947,7 +984,8 @@ impl ExecutionHub {
         admin.require_auth();
         Self::verify_admin(&env, &admin);
         Self::set_behavior_profile(&env, &profile);
-        env.events().publish((symbol_short!("bp_ovr"),), (profile.agent_id,));
+        env.events()
+            .publish((symbol_short!("bp_ovr"),), (profile.agent_id,));
     }
 
     // --- Threshold keyshare APIs ---
@@ -975,9 +1013,14 @@ impl ExecutionHub {
 
         // store agent metadata
         let meta_key = (symbol_short!("tmeta"), agent_id);
-        env.storage().instance().set(&meta_key, &(threshold_m, n_parties));
+        env.storage()
+            .instance()
+            .set(&meta_key, &(threshold_m, n_parties));
 
-        env.events().publish((symbol_short!("th_agent"),), (agent_id, threshold_m, n_parties));
+        env.events().publish(
+            (symbol_short!("th_agent"),),
+            (agent_id, threshold_m, n_parties),
+        );
     }
 
     pub fn propose_action(env: Env, proposer: Address, agent_id: u64, action_data: Bytes) -> u64 {
@@ -1010,7 +1053,8 @@ impl ExecutionHub {
 
         let pkey = (symbol_short!("tprop"), ctr);
         env.storage().instance().set(&pkey, &proposal);
-        env.events().publish((symbol_short!("prop"),), (ctr, agent_id));
+        env.events()
+            .publish((symbol_short!("prop"),), (ctr, agent_id));
         ctr
     }
 
@@ -1018,14 +1062,22 @@ impl ExecutionHub {
         signer.require_auth();
 
         let pkey = (symbol_short!("tprop"), proposal_id);
-        let mut proposal: ThresholdProposal = env.storage().instance().get(&pkey).expect("proposal not found");
+        let mut proposal: ThresholdProposal = env
+            .storage()
+            .instance()
+            .get(&pkey)
+            .expect("proposal not found");
         if proposal.status != ProposalStatus::Pending {
             panic!("proposal not pending");
         }
 
         // verify signer is a registered share holder
         let shares_key = (symbol_short!("tshares"), proposal.agent_id);
-            let shares: Vec<ThresholdKeyShare> = env.storage().instance().get(&shares_key).expect("no shares for agent");
+        let shares: Vec<ThresholdKeyShare> = env
+            .storage()
+            .instance()
+            .get(&shares_key)
+            .expect("no shares for agent");
         let mut allowed = false;
         for s in shares.iter() {
             if s.share_holder == signer {
@@ -1049,7 +1101,8 @@ impl ExecutionHub {
             env.storage().instance().set(&pkey, &proposal);
         }
 
-        env.events().publish((symbol_short!("psigned"),), (proposal_id, signer.clone()));
+        env.events()
+            .publish((symbol_short!("psigned"),), (proposal_id, signer.clone()));
 
         // if enough signatures, execute
         let unique_signers = proposal.signers.len() as u32;
@@ -1058,7 +1111,10 @@ impl ExecutionHub {
             proposal.status = ProposalStatus::Executed;
             env.storage().instance().set(&pkey, &proposal);
             // emit executed event and call execution hook (off-chain aggregation expected)
-            env.events().publish((symbol_short!("th_exec"),), (proposal_id, proposal.agent_id));
+            env.events().publish(
+                (symbol_short!("th_exec"),),
+                (proposal_id, proposal.agent_id),
+            );
         }
     }
 
@@ -1067,7 +1123,11 @@ impl ExecutionHub {
         let meta: Option<(u32, u32)> = env.storage().instance().get(&meta_key);
         if let Some((threshold_m, n)) = meta {
             let shares_key = (symbol_short!("tshares"), agent_id);
-            let shares: Vec<ThresholdKeyShare> = env.storage().instance().get(&shares_key).unwrap_or_else(|| Vec::new(&env));
+            let shares: Vec<ThresholdKeyShare> = env
+                .storage()
+                .instance()
+                .get(&shares_key)
+                .unwrap_or_else(|| Vec::new(&env));
             (threshold_m, n, shares.len() as u32)
         } else {
             (0, 0, 0)
@@ -1078,7 +1138,11 @@ impl ExecutionHub {
         admin_addr.require_auth();
         Self::verify_admin(&env, &admin_addr);
         let shares_key = (symbol_short!("tshares"), agent_id);
-        let mut shares: Vec<ThresholdKeyShare> = env.storage().instance().get(&shares_key).expect("no shares for agent");
+        let mut shares: Vec<ThresholdKeyShare> = env
+            .storage()
+            .instance()
+            .get(&shares_key)
+            .expect("no shares for agent");
         let mut newv = Vec::new(&env);
         for s in shares.iter() {
             if s.share_holder != holder {
@@ -1086,7 +1150,8 @@ impl ExecutionHub {
             }
         }
         env.storage().instance().set(&shares_key, &newv);
-        env.events().publish((symbol_short!("th_revoke"),), (agent_id, holder));
+        env.events()
+            .publish((symbol_short!("th_revoke"),), (agent_id, holder));
     }
 
     /// Submit M decrypted shares (y_values) and proofs for recovery. This function verifies commitments
@@ -1121,7 +1186,11 @@ impl ExecutionHub {
 
         // validate proofs against stored commitments
         let shares_key = (symbol_short!("tshares"), agent_id);
-        let shares: Vec<ThresholdKeyShare> = env.storage().instance().get(&shares_key).expect("no shares for agent");
+        let shares: Vec<ThresholdKeyShare> = env
+            .storage()
+            .instance()
+            .get(&shares_key)
+            .expect("no shares for agent");
 
         // build map from index -> commitment
         let mut commit_map: Map<u32, Bytes> = Map::new(&env);
@@ -1144,11 +1213,18 @@ impl ExecutionHub {
 
         // store recovery attempt under (trec, agent_id, submitter)
         let rec_key = (symbol_short!("trec"), agent_id, submitter.clone());
-        let payload = (share_indices.clone(), y_values.clone(), env.ledger().timestamp());
+        let payload = (
+            share_indices.clone(),
+            y_values.clone(),
+            env.ledger().timestamp(),
+        );
         env.storage().instance().set(&rec_key, &payload);
 
         // emit event to indicate recovery ready; off-chain can listen and perform interpolation
-        env.events().publish((symbol_short!("th_rec"),), (agent_id, submitter, share_indices.len() as u32));
+        env.events().publish(
+            (symbol_short!("th_rec"),),
+            (agent_id, submitter, share_indices.len() as u32),
+        );
     }
 
     // Helper: Get agent owner from AgentNFT contract
@@ -1231,9 +1307,33 @@ mod test {
 
         let now = env.ledger().timestamp();
 
-        let s1 = ThresholdKeyShare { agent_id, share_holder: holder1.clone(), share_index: 1, x_coordinate: 1, y_coordinate_encrypted: Bytes::from_array(&env, &[1u8]), commitment: Bytes::from_array(&env, &[11u8]), created_at: now };
-        let s2 = ThresholdKeyShare { agent_id, share_holder: holder2.clone(), share_index: 2, x_coordinate: 2, y_coordinate_encrypted: Bytes::from_array(&env, &[2u8]), commitment: Bytes::from_array(&env, &[22u8]), created_at: now };
-        let s3 = ThresholdKeyShare { agent_id, share_holder: holder3.clone(), share_index: 3, x_coordinate: 3, y_coordinate_encrypted: Bytes::from_array(&env, &[3u8]), commitment: Bytes::from_array(&env, &[33u8]), created_at: now };
+        let s1 = ThresholdKeyShare {
+            agent_id,
+            share_holder: holder1.clone(),
+            share_index: 1,
+            x_coordinate: 1,
+            y_coordinate_encrypted: Bytes::from_array(&env, &[1u8]),
+            commitment: Bytes::from_array(&env, &[11u8]),
+            created_at: now,
+        };
+        let s2 = ThresholdKeyShare {
+            agent_id,
+            share_holder: holder2.clone(),
+            share_index: 2,
+            x_coordinate: 2,
+            y_coordinate_encrypted: Bytes::from_array(&env, &[2u8]),
+            commitment: Bytes::from_array(&env, &[22u8]),
+            created_at: now,
+        };
+        let s3 = ThresholdKeyShare {
+            agent_id,
+            share_holder: holder3.clone(),
+            share_index: 3,
+            x_coordinate: 3,
+            y_coordinate_encrypted: Bytes::from_array(&env, &[3u8]),
+            commitment: Bytes::from_array(&env, &[33u8]),
+            created_at: now,
+        };
 
         let mut shares = Vec::new(&env);
         shares.push_back(s1.clone());

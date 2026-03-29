@@ -1,7 +1,5 @@
 #![no_std]
 
-extern crate alloc;
-
 #[cfg(test)]
 mod tests;
 #[cfg(any(test, feature = "testutils"))]

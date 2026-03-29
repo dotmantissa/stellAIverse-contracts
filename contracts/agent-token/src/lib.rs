@@ -274,7 +274,7 @@ mod tests {
         let client = AgentTokenClient::new(env, &id);
         let admin = Address::generate(env);
         env.mock_all_auths();
-        client.init_contract(&admin).unwrap();
+        client.init_contract(&admin);
         (client, admin)
     }
 
@@ -284,21 +284,19 @@ mod tests {
         let (client, admin) = setup(&env);
 
         let owner = Address::generate(&env);
-        let id = client
-            .mint(
-                &admin,
-                &owner,
-                &String::from_str(&env, "TestAgent"),
-                &String::from_str(&env, "hash"),
-                &String::from_str(&env, "QmCid"),
-                &Vec::new(&env),
-                &None,
-            )
-            .unwrap();
+        let id = client.mint(
+            &admin,
+            &owner,
+            &String::from_str(&env, "TestAgent"),
+            &String::from_str(&env, "hash"),
+            &String::from_str(&env, "QmCid"),
+            &Vec::new(&env),
+            &None,
+        );
 
         assert_eq!(id, 1u64);
         assert_eq!(client.total_supply(), 1u64);
-        assert_eq!(client.get_owner(&1u64).unwrap(), owner);
+        assert_eq!(client.get_owner(&1u64), owner);
     }
 
     #[test]
@@ -308,20 +306,18 @@ mod tests {
         let owner = Address::generate(&env);
         let next = Address::generate(&env);
 
-        client
-            .mint(
-                &admin,
-                &owner,
-                &String::from_str(&env, "A"),
-                &String::from_str(&env, "h"),
-                &String::from_str(&env, "QmT"),
-                &Vec::new(&env),
-                &None,
-            )
-            .unwrap();
+        client.mint(
+            &admin,
+            &owner,
+            &String::from_str(&env, "A"),
+            &String::from_str(&env, "h"),
+            &String::from_str(&env, "QmT"),
+            &Vec::new(&env),
+            &None,
+        );
 
-        client.transfer(&1u64, &owner, &next).unwrap();
-        assert_eq!(client.get_owner(&1u64).unwrap(), next);
+        client.transfer(&1u64, &owner, &next);
+        assert_eq!(client.get_owner(&1u64), next);
     }
 
     #[test]
@@ -330,19 +326,17 @@ mod tests {
         let (client, admin) = setup(&env);
         let owner = Address::generate(&env);
 
-        client
-            .mint(
-                &admin,
-                &owner,
-                &String::from_str(&env, "B"),
-                &String::from_str(&env, "h"),
-                &String::from_str(&env, "QmB"),
-                &Vec::new(&env),
-                &None,
-            )
-            .unwrap();
+        client.mint(
+            &admin,
+            &owner,
+            &String::from_str(&env, "B"),
+            &String::from_str(&env, "h"),
+            &String::from_str(&env, "QmB"),
+            &Vec::new(&env),
+            &None,
+        );
 
-        client.burn(&1u64, &owner).unwrap();
+        client.burn(&1u64, &owner);
         assert!(client.try_get_owner(&1u64).is_err());
     }
 

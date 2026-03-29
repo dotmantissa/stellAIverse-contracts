@@ -1,5 +1,4 @@
 #![no_std]
-extern crate alloc;
 
 // use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Map};
 use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};

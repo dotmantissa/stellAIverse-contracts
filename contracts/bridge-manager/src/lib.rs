@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec, IntoVal};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec,
+};
 
 // Interface for the AgentNFT contract
 #[soroban_sdk::contractclient(name = "AgentNFTClient")]
@@ -278,7 +280,7 @@ impl BridgeManager {
             bridge_id,
             agent_id,
             owner: owner.clone(),
-            metadata_cid,
+            metadata_cid: metadata_cid.clone(),
             source_chain: 0, // Stellar canonical source
             target_chain,
             notional_value,

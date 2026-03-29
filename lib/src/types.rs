@@ -1,5 +1,4 @@
 use soroban_sdk::{contracttype, Address, Bytes, Map, String, Symbol, Val, Vec};
-use soroban_sdk::{contracttype, Address, Bytes, String, Symbol, Val, Vec, Map};
 
 /// Oracle data entry
 #[derive(Clone, Debug)]
@@ -168,6 +167,7 @@ pub enum OptionalRoyaltyInfo {
 pub enum AuctionType {
     English = 0,
     Dutch = 1,
+    Sealed = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +235,14 @@ pub struct SealedReveal {
     pub amount: i128,
     pub nonce: String,
     pub deposit: i128,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BidRecord {
+    pub bidder: Address,
+    pub amount: i128,
     pub timestamp: u64,
 }
 
@@ -520,7 +528,7 @@ pub struct VerifiableCredential {
     pub id: String,
     pub credential_id: u64,
     pub issuer: Address,
-    pub subject: String,  // DID of the subject
+    pub subject: String, // DID of the subject
     pub credential_type: Vec<String>,
     pub credential_schema: String,
     pub credential_status: CredentialStatus,

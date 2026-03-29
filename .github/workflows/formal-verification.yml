@@ -107,9 +107,13 @@ jobs:
 
             summary += `\n_Commit: ${context.sha.slice(0, 7)}_`;
 
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: summary
-            });
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            } catch (error) {
+              core.warning(`Skipping PR comment: ${error.message}`);
+            }

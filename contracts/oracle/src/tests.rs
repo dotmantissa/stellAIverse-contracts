@@ -2,7 +2,7 @@
 extern crate alloc;
 
 use crate::{Oracle, OracleClient, RelayRequest};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::xdr::{self, Limited, Limits, WriteXdr};
 use soroban_sdk::{

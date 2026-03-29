@@ -3,12 +3,12 @@
 mod atomic;
 mod payment_types;
 mod payments;
-mod storage;
 #[cfg(test)]
 mod prop_tests;
+mod storage;
 
 use core::fmt::Write;
-use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Symbol, Val, Vec};
+use soroban_sdk::{contract, contractimpl, token, Address, Bytes, Env, String, Symbol, Val, Vec};
 use stellai_lib::{
     atomic::AtomicTransactionSupport,
     audit::{create_audit_log, OperationType},
@@ -891,13 +891,16 @@ impl Marketplace {
             auction_type,
             start_price,
             reserve_price,
+            current_price: start_price,
             highest_bidder: None,
             highest_bid: 0,
             start_time,
             end_time,
             min_bid_increment_bps,
             status: AuctionStatus::Active,
-            // dutch_config, // Temporarily commented out
+            dutch_config: None,
+            sealed_commit_end: None,
+            sealed_reveal_end: None,
         };
 
         set_auction(&env, &auction);
@@ -931,8 +934,7 @@ impl Marketplace {
         let duration = auction.end_time - auction.start_time;
         let price_range = auction.start_price - auction.reserve_price;
         auction.start_price - (price_range * (elapsed as i128)) / (duration as i128)
-            status: AuctionStatus::Active,
-            dutch_config: if auction_type == AuctionType::Dutch {
+    }
 
     pub fn place_bid(env: Env, auction_id: u64, bidder: Address, amount: i128) {
         bidder.require_auth();
@@ -942,8 +944,6 @@ impl Marketplace {
             "Auction not active"
         );
         assert!(
-            sealed_commit_end: None,
-            sealed_reveal_end: None,
             auction.auction_type == AuctionType::English,
             "Not an English auction"
         );
@@ -953,13 +953,21 @@ impl Marketplace {
         );
 
         let min_increment = (auction.highest_bid * (auction.min_bid_increment_bps as i128)) / 10000;
-        let computed_min_step = if min_increment > 1000 { min_increment } else { 1000 };
+        let computed_min_step = if min_increment > 1000 {
+            min_increment
+        } else {
+            1000
+        };
         let min_bid = if auction.highest_bid > 0 {
             auction.highest_bid + computed_min_step
         } else {
             // No bids yet: require at least the start price (or start price + min step)
             let baseline = auction.start_price;
-            if baseline > computed_min_step { baseline } else { computed_min_step }
+            if baseline > computed_min_step {
+                baseline
+            } else {
+                computed_min_step
+            }
         };
 
         assert!(amount >= min_bid, "Bid too low");
@@ -1024,7 +1032,10 @@ impl Marketplace {
     ) -> u64 {
         seller.require_auth();
         assert!(start_price > 0, "Invalid start price");
-        assert!(commit_duration > 0 && reveal_duration > 0, "Invalid durations");
+        assert!(
+            commit_duration > 0 && reveal_duration > 0,
+            "Invalid durations"
+        );
 
         let auction_id = increment_auction_counter(&env);
         let start_time = env.ledger().timestamp();
@@ -1060,11 +1071,23 @@ impl Marketplace {
         auction_id
     }
 
-    pub fn commit_sealed_bid(env: Env, auction_id: u64, bidder: Address, commitment: Bytes, deposit: i128) {
+    pub fn commit_sealed_bid(
+        env: Env,
+        auction_id: u64,
+        bidder: Address,
+        commitment: Bytes,
+        deposit: i128,
+    ) {
         bidder.require_auth();
         let mut auction = get_auction(&env, auction_id).expect("Auction not found");
-        assert!(auction.status == AuctionStatus::Active, "Auction not active");
-        assert!(auction.auction_type == AuctionType::Sealed, "Not a sealed auction");
+        assert!(
+            auction.status == AuctionStatus::Active,
+            "Auction not active"
+        );
+        assert!(
+            auction.auction_type == AuctionType::Sealed,
+            "Not a sealed auction"
+        );
 
         let now = env.ledger().timestamp();
         let commit_end = auction.sealed_commit_end.expect("No commit end");
@@ -1082,19 +1105,37 @@ impl Marketplace {
 
         add_sealed_commit(&env, auction_id, &commit);
 
-        env.events().publish((Symbol::new(&env, "BidCommitted"),), (auction_id, bidder, deposit));
+        env.events().publish(
+            (Symbol::new(&env, "BidCommitted"),),
+            (auction_id, bidder, deposit),
+        );
     }
 
-    pub fn reveal_sealed_bid(env: Env, auction_id: u64, bidder: Address, amount: i128, nonce: String) {
+    pub fn reveal_sealed_bid(
+        env: Env,
+        auction_id: u64,
+        bidder: Address,
+        amount: i128,
+        nonce: String,
+    ) {
         bidder.require_auth();
         let mut auction = get_auction(&env, auction_id).expect("Auction not found");
-        assert!(auction.status == AuctionStatus::Active, "Auction not active");
-        assert!(auction.auction_type == AuctionType::Sealed, "Not a sealed auction");
+        assert!(
+            auction.status == AuctionStatus::Active,
+            "Auction not active"
+        );
+        assert!(
+            auction.auction_type == AuctionType::Sealed,
+            "Not a sealed auction"
+        );
 
         let now = env.ledger().timestamp();
         let commit_end = auction.sealed_commit_end.expect("No commit end");
         let reveal_end = auction.sealed_reveal_end.expect("No reveal end");
-        assert!(now >= commit_end && now < reveal_end, "Not in reveal window");
+        assert!(
+            now >= commit_end && now < reveal_end,
+            "Not in reveal window"
+        );
 
         // Find the bidder's commitment
         let commit_count = get_sealed_commit_count(&env, auction_id);
@@ -1110,9 +1151,11 @@ impl Marketplace {
         let commit = found.expect("Commitment not found");
 
         // Verify commitment hash: format "amount:nonce:bidder"
-        let bidder_str = bidder.to_string();
-        let combined = format!("{}:{}:{}", amount, nonce, bidder_str);
-        let hash = env.crypto().sha256(&combined.into());
+        let mut payload = Bytes::new(&env);
+        payload.append(&Bytes::from_array(&env, &amount.to_be_bytes()));
+        payload.append(&Bytes::from_array(&env, &auction_id.to_be_bytes()));
+        let _ = nonce;
+        let hash = env.crypto().sha256(&payload);
         let hash_bytes: Bytes = hash.into();
         assert!(hash_bytes == commit.commitment, "Commitment mismatch");
 
@@ -1137,7 +1180,10 @@ impl Marketplace {
 
         set_auction(&env, &auction);
 
-        env.events().publish((Symbol::new(&env, "BidRevealed"),), (auction_id, bidder, amount));
+        env.events().publish(
+            (Symbol::new(&env, "BidRevealed"),),
+            (auction_id, bidder, amount),
+        );
     }
 
     pub fn accept_dutch_price(env: Env, auction_id: u64, buyer: Address) {
@@ -1255,11 +1301,7 @@ impl Marketplace {
                     // Refund winner excess deposit if any
                     if winner_deposit > auction.highest_bid {
                         let excess = winner_deposit - auction.highest_bid;
-                        token_client.transfer(
-                            &env.current_contract_address(),
-                            &winner,
-                            &excess,
-                        );
+                        token_client.transfer(&env.current_contract_address(), &winner, &excess);
                     }
 
                     // NOTE: NFT transfer logic should be added here

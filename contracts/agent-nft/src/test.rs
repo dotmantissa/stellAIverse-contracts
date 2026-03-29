@@ -3,9 +3,9 @@ mod prop_tests {
     extern crate alloc;
     use super::*;
     use crate::{AgentMintData, AgentNFT, AgentNFTClient, ContractError};
-    use soroban_sdk::testutils::Address as _;
     use alloc::string::ToString;
     use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{Address, Env, String, Vec};
     use stellai_lib::types::OptionalRoyaltyInfo;
 
@@ -18,7 +18,14 @@ mod prop_tests {
         (client, admin)
     }
 
-    fn mint_test_agent(env: &Env, client: &AgentNFTClient, owner: &Address, agent_id: u128, metadata_cid: &str, evolution_level: u32) {
+    fn mint_test_agent(
+        env: &Env,
+        client: &AgentNFTClient,
+        owner: &Address,
+        agent_id: u128,
+        metadata_cid: &str,
+        evolution_level: u32,
+    ) {
         client.mint_agent(
             &agent_id,
             owner,
@@ -396,5 +403,79 @@ mod prop_tests {
             result.is_err(),
             "Non-minter should not be able to batch_mint"
         );
+    }
+
+    #[test]
+    fn test_mint_agent_empty_metadata_fails_with_invalid_metadata() {
+        let env = Env::default();
+        let (client, admin) = setup_contract(&env);
+        let owner = Address::generate(&env);
+        env.mock_all_auths();
+        client.add_approved_minter(&admin, &owner);
+
+        let result =
+            client.try_mint_agent(&1, &owner, &String::from_str(&env, ""), &1, &None, &None);
+
+        match result {
+            Err(Ok(ContractError::InvalidMetadata)) => {}
+            _ => panic!(
+                "Expected InvalidMetadata for empty metadata, got {:?}",
+                result
+            ),
+        }
+    }
+
+    #[test]
+    fn test_mint_agent_legacy_empty_capability_fails_with_invalid_metadata() {
+        let env = Env::default();
+        let (client, admin) = setup_contract(&env);
+        let owner = Address::generate(&env);
+        env.mock_all_auths();
+        client.add_approved_minter(&admin, &owner);
+
+        let caps = Vec::from_array(&env, [String::from_str(&env, "")]);
+        let result = client.try_mint_agent_legacy(
+            &owner,
+            &String::from_str(&env, "Name"),
+            &String::from_str(&env, "Hash"),
+            &caps,
+            &None,
+            &None,
+        );
+
+        match result {
+            Err(Ok(ContractError::InvalidMetadata)) => {}
+            _ => panic!(
+                "Expected InvalidMetadata for empty capability, got {:?}",
+                result
+            ),
+        }
+    }
+
+    #[test]
+    fn test_batch_mint_is_atomic_when_validation_fails() {
+        let env = Env::default();
+        let (client, admin) = setup_contract(&env);
+        env.mock_all_auths();
+        client.add_approved_minter(&admin, &admin);
+
+        let mut agents = Vec::new(&env);
+        agents.push_back(make_mint_data(&env, "valid"));
+
+        let mut invalid = make_mint_data(&env, "invalid");
+        invalid.metadata_cid = String::from_str(&env, "");
+        agents.push_back(invalid);
+
+        let result = client.try_batch_mint(&admin, &agents);
+        match result {
+            Err(Ok(ContractError::InvalidMetadata)) => {}
+            _ => panic!(
+                "Expected InvalidMetadata for invalid batch item, got {:?}",
+                result
+            ),
+        }
+
+        assert_eq!(client.total_agents(), 0u64);
+        assert!(client.try_get_agent(&1).is_err());
     }
 }

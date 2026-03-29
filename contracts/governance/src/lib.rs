@@ -1,8 +1,4 @@
 #![no_std]
-
-extern crate alloc;
-
-use alloc::vec::Vec as StdVec;
 use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, Env, String, Symbol, Val, Vec,
 };

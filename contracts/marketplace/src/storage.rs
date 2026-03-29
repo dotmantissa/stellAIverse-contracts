@@ -207,8 +207,14 @@ pub fn get_bid_history_count(env: &Env, auction_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
-pub fn get_bid_history_entry(env: &Env, auction_id: u64, index: u64) -> Option<stellai_lib::BidRecord> {
-    env.storage().instance().get(&DataKey::AuctionBid(auction_id, index))
+pub fn get_bid_history_entry(
+    env: &Env,
+    auction_id: u64,
+    index: u64,
+) -> Option<stellai_lib::BidRecord> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AuctionBid(auction_id, index))
 }
 
 pub fn add_sealed_commit(env: &Env, auction_id: u64, commit: &stellai_lib::SealedCommit) {
@@ -228,8 +234,14 @@ pub fn get_sealed_commit_count(env: &Env, auction_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
-pub fn get_sealed_commit_entry(env: &Env, auction_id: u64, index: u64) -> Option<stellai_lib::SealedCommit> {
-    env.storage().instance().get(&DataKey::SealedCommit(auction_id, index))
+pub fn get_sealed_commit_entry(
+    env: &Env,
+    auction_id: u64,
+    index: u64,
+) -> Option<stellai_lib::SealedCommit> {
+    env.storage()
+        .instance()
+        .get(&DataKey::SealedCommit(auction_id, index))
 }
 
 pub fn add_sealed_reveal(env: &Env, auction_id: u64, reveal: &stellai_lib::SealedReveal) {
@@ -249,8 +261,14 @@ pub fn get_sealed_reveal_count(env: &Env, auction_id: u64) -> u64 {
         .unwrap_or(0)
 }
 
-pub fn get_sealed_reveal_entry(env: &Env, auction_id: u64, index: u64) -> Option<stellai_lib::SealedReveal> {
-    env.storage().instance().get(&DataKey::SealedReveal(auction_id, index))
+pub fn get_sealed_reveal_entry(
+    env: &Env,
+    auction_id: u64,
+    index: u64,
+) -> Option<stellai_lib::SealedReveal> {
+    env.storage()
+        .instance()
+        .get(&DataKey::SealedReveal(auction_id, index))
 }
 
 /* ---------------- HELPERS ---------------- */

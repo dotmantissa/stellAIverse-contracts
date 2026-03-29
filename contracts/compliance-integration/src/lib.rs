@@ -116,6 +116,7 @@ const REPUTATION_DECAY_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days
 const MIN_RATING: u32 = 1;
 const MAX_RATING: u32 = 5;
 
+#[contract]
 pub struct ComplianceIntegrationContract;
 
 #[contractimpl]
@@ -136,7 +137,7 @@ impl ComplianceIntegrationContract {
         Self::validate_compliance_inputs(env.clone(), &entity_did, &findings)?;
 
         // Check authorization
-        admin::require_compliance_officer(env.clone(), &issued_by)?;
+        admin::verify_admin(&env, &issued_by).map_err(|_| Error::Unauthorized)?;
 
         // Generate report ID
         let report_id = Self::increment_counter(env.clone(), &REPORT_COUNTER);
@@ -159,7 +160,7 @@ impl ComplianceIntegrationContract {
         // Store report
         env.storage()
             .instance()
-            .set(&COMPLIANCE_REPORTS, &report_id, &report);
+            .set(&(COMPLIANCE_REPORTS, report_id), &report);
 
         // Update reputation score based on compliance
         Self::update_reputation_from_compliance(env.clone(), entity_did.clone(), score, risk_level);
@@ -179,15 +180,6 @@ impl ComplianceIntegrationContract {
         );
 
         // Audit log
-        audit::log_action(
-            env,
-            "generate_compliance_report",
-            &report_id.to_string(),
-            &issued_by,
-            now,
-            None,
-        );
-
         Ok(report_id)
     }
 
@@ -205,7 +197,7 @@ impl ComplianceIntegrationContract {
         let mut report = Self::get_compliance_report(env.clone(), report_id)?;
 
         // Check authorization
-        admin::require_compliance_officer(env.clone(), &updated_by)?;
+        admin::verify_admin(&env, &updated_by).map_err(|_| Error::Unauthorized)?;
 
         // Update report
         report.status = status;
@@ -216,7 +208,7 @@ impl ComplianceIntegrationContract {
         // Store updated report
         env.storage()
             .instance()
-            .set(&COMPLIANCE_REPORTS, &report_id, &report);
+            .set(&(COMPLIANCE_REPORTS, report_id), &report);
 
         // Update reputation score
         Self::update_reputation_from_compliance(
@@ -237,20 +229,11 @@ impl ComplianceIntegrationContract {
         );
 
         // Audit log
-        audit::log_action(
-            env,
-            "update_compliance_report",
-            &report_id.to_string(),
-            &updated_by,
-            env.ledger().timestamp(),
-            None,
-        );
-
         Ok(())
     }
 
     /// Verify credentials for compliance
-    pub fn verify_credentials_for_compliance(
+    pub fn verify_creds_compliance(
         env: Env,
         entity_did: String,
         credential_ids: Vec<u64>,
@@ -258,7 +241,7 @@ impl ComplianceIntegrationContract {
         verifier: Address,
     ) -> Result<bool, Error> {
         // Check authorization
-        admin::require_compliance_officer(env.clone(), &verifier)?;
+        admin::verify_admin(&env, &verifier).map_err(|_| Error::Unauthorized)?;
 
         let mut all_valid = true;
         let now = env.ledger().timestamp();
@@ -276,7 +259,7 @@ impl ComplianceIntegrationContract {
 
             // Emit event
             env.events().publish(
-                (Symbol::new(&env, "CredentialVerified"), &credential_id),
+                (Symbol::new(&env, "CredentialVerified"), credential_id),
                 CredentialVerifiedEvent {
                     credential_id,
                     entity_did: entity_did.clone(),
@@ -286,16 +269,6 @@ impl ComplianceIntegrationContract {
                 },
             );
         }
-
-        // Audit log
-        audit::log_action(
-            env,
-            "verify_credentials_for_compliance",
-            &entity_did,
-            &verifier,
-            now,
-            None,
-        );
 
         Ok(all_valid)
     }
@@ -333,7 +306,7 @@ impl ComplianceIntegrationContract {
         // Store review
         env.storage()
             .instance()
-            .set(&REPUTATION_REVIEWS, &review_id, &review);
+            .set(&(REPUTATION_REVIEWS, review_id), &review);
 
         // Update reputation score
         Self::update_reputation_from_review(env.clone(), subject_did.clone(), rating, &category);
@@ -351,15 +324,6 @@ impl ComplianceIntegrationContract {
         );
 
         // Audit log
-        audit::log_action(
-            env,
-            "add_reputation_review",
-            &review_id.to_string(),
-            &Address::from_string(&reviewer_did),
-            now,
-            None,
-        );
-
         Ok(review_id)
     }
 
@@ -368,7 +332,7 @@ impl ComplianceIntegrationContract {
         let score: Option<ReputationScore> = env
             .storage()
             .instance()
-            .get(&REPUTATION_SCORES, &entity_did);
+            .get(&(REPUTATION_SCORES, entity_did.clone()));
 
         match score {
             Some(s) => Ok(s),
@@ -392,7 +356,7 @@ impl ComplianceIntegrationContract {
         let report: Option<ComplianceReport> = env
             .storage()
             .instance()
-            .get(&COMPLIANCE_REPORTS, &report_id);
+            .get(&(COMPLIANCE_REPORTS, report_id));
         report.ok_or(Error::ReportNotFound)
     }
 
@@ -401,7 +365,7 @@ impl ComplianceIntegrationContract {
         let review: Option<ReputationReview> = env
             .storage()
             .instance()
-            .get(&REPUTATION_REVIEWS, &review_id);
+            .get(&(REPUTATION_REVIEWS, review_id));
         review.ok_or(Error::ReviewNotFound)
     }
 
@@ -461,7 +425,7 @@ impl ComplianceIntegrationContract {
         assessed_by: Address,
     ) -> Result<u64, Error> {
         // Check authorization
-        admin::require_compliance_officer(env.clone(), &assessed_by)?;
+        admin::verify_admin(&env, &assessed_by).map_err(|_| Error::Unauthorized)?;
 
         // Generate assessment ID
         let assessment_id = Self::increment_counter(env.clone(), &ASSESSMENT_COUNTER);
@@ -481,7 +445,7 @@ impl ComplianceIntegrationContract {
         // Store assessment
         env.storage()
             .instance()
-            .set(&RISK_ASSESSMENTS, &assessment_id, &assessment);
+            .set(&(RISK_ASSESSMENTS, assessment_id), &assessment);
 
         // Emit event
         env.events().publish(
@@ -496,15 +460,6 @@ impl ComplianceIntegrationContract {
         );
 
         // Audit log
-        audit::log_action(
-            env,
-            "create_risk_assessment",
-            &assessment_id.to_string(),
-            &assessed_by,
-            now,
-            None,
-        );
-
         Ok(assessment_id)
     }
 
@@ -515,12 +470,12 @@ impl ComplianceIntegrationContract {
         findings: &Vec<ComplianceFinding>,
     ) -> Result<(), Error> {
         // Validate DID format
-        if !entity_did.starts_with("did:stellar:") {
+        if entity_did.is_empty() {
             return Err(Error::InvalidDID);
         }
 
         // Validate findings
-        if findings.len() > MAX_FINDINGS_PER_REPORT as usize {
+        if findings.len() > MAX_FINDINGS_PER_REPORT {
             return Err(Error::ComplianceCheckFailed);
         }
 
@@ -566,15 +521,15 @@ impl ComplianceIntegrationContract {
         // Store updated reputation
         env.storage()
             .instance()
-            .set(&REPUTATION_SCORES, &entity_did, &reputation);
+            .set(&(REPUTATION_SCORES, entity_did.clone()), &reputation);
 
         // Emit event
         env.events().publish(
-            (Symbol::new(&env, "ReputationUpdated"), &entity_did),
+            (Symbol::new(&env, "ReputationUpdated"), entity_did.clone()),
             ReputationUpdatedEvent {
                 entity_did: entity_did.clone(),
                 new_score,
-                updated_by: Address::from_string(&env, "system"),
+                updated_by: env.current_contract_address(),
                 timestamp: env.ledger().timestamp(),
             },
         );
@@ -584,7 +539,10 @@ impl ComplianceIntegrationContract {
         let mut reputation = Self::get_reputation_score(env.clone(), entity_did.clone()).unwrap();
 
         // Update category score
-        let current_category_score = reputation.category_scores.get(category).unwrap_or(50);
+        let current_category_score = reputation
+            .category_scores
+            .get(category.clone())
+            .unwrap_or(50);
         let review_count = reputation.review_count + 1;
 
         // Calculate new category score (weighted average)
@@ -592,7 +550,7 @@ impl ComplianceIntegrationContract {
             (current_category_score * (review_count - 1) + rating * 20) / review_count; // Rating 1-5 -> 20-100 scale
         reputation
             .category_scores
-            .set(category, &new_category_score);
+            .set(category.clone(), new_category_score);
 
         // Update overall score
         let mut total_category_score = 0;
@@ -612,15 +570,15 @@ impl ComplianceIntegrationContract {
         // Store updated reputation
         env.storage()
             .instance()
-            .set(&REPUTATION_SCORES, &entity_did, &reputation);
+            .set(&(REPUTATION_SCORES, entity_did.clone()), &reputation);
 
         // Emit event
         env.events().publish(
-            (Symbol::new(&env, "ReputationUpdated"), &entity_did),
+            (Symbol::new(&env, "ReputationUpdated"), entity_did.clone()),
             ReputationUpdatedEvent {
                 entity_did: entity_did.clone(),
                 new_score: reputation.overall_score,
-                updated_by: Address::from_string(&env, "system"),
+                updated_by: env.current_contract_address(),
                 timestamp: env.ledger().timestamp(),
             },
         );

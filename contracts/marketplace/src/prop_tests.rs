@@ -25,12 +25,7 @@ mod prop_tests {
     }
 
     /// Create a listing and return its id.
-    fn make_listing(
-        env: &Env,
-        client: &MarketplaceClient,
-        agent_id: u64,
-        price: i128,
-    ) -> u64 {
+    fn make_listing(env: &Env, client: &MarketplaceClient, agent_id: u64, price: i128) -> u64 {
         let seller = Address::generate(env);
         client.create_listing(&agent_id, &seller, &0u32, &price)
     }
