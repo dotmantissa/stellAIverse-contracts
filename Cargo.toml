@@ -17,6 +17,9 @@ members = [
     "contracts/identity-did",
     "contracts/verifiable-credentials",
     "contracts/compliance-integration",
+    "contracts/waitlist-tokens",
+    "contracts/referral-rewards",
+    "contracts/staking-bonuses",
     "lib",
     "shared",
 ]

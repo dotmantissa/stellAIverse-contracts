@@ -128,6 +128,126 @@ impl Governance {
         proposal_id
     }
 
+    /// Submit a proposal to the waitlist (requires deposit)
+    pub fn submit_to_waitlist(
+        env: Env,
+        proposer: Address,
+        title: String,
+        description: String,
+        proposal_type: ProposalType,
+        parameters: ProposalParameters,
+    ) -> u64 {
+        proposer.require_auth();
+
+        let min_deposit = get_min_proposal_deposit(&env);
+        let governance_token = get_governance_token(&env);
+        let token_client = token::Client::new(&env, &governance_token);
+        
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&proposer, &contract_address, &(min_deposit as i128));
+
+        let waitlist_id = increment_waitlist_counter(&env);
+        let waitlist_proposal = WaitlistProposal {
+            waitlist_id,
+            proposer: proposer.clone(),
+            title,
+            description,
+            proposal_type,
+            parameters,
+            deposit_amount: min_deposit,
+            submitted_at: env.ledger().timestamp(),
+        };
+
+        set_waitlist_proposal(&env, &waitlist_proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "ProposalWaitlisted"),),
+            (waitlist_id, proposer, env.ledger().timestamp()),
+        );
+
+        waitlist_id
+    }
+
+    /// Promote a waitlisted proposal to active voting
+    pub fn promote_to_voting(
+        env: Env,
+        admin: Address,
+        waitlist_id: u64,
+        voting_period: u64,
+    ) -> u64 {
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        let waitlist_proposal = get_waitlist_proposal(&env, waitlist_id)
+            .expect("Waitlisted proposal not found");
+
+        let proposal_id = increment_proposal_counter(&env);
+        let current_time = env.ledger().timestamp();
+        
+        let proposal = Proposal {
+            proposal_id,
+            title: waitlist_proposal.title,
+            description: waitlist_proposal.description,
+            proposer: waitlist_proposal.proposer.clone(),
+            voting_starts: current_time,
+            voting_ends: current_time + voting_period,
+            proposal_type: waitlist_proposal.proposal_type,
+            has_parameters: true,
+            parameters: waitlist_proposal.parameters,
+            votes_for: 0,
+            votes_against: 0,
+            votes_abstain: 0,
+            status: ProposalStatus::Active,
+            target_contract: None,
+            target_function: None,
+            target_args: None,
+        };
+
+        set_proposal(&env, &proposal);
+        remove_waitlist_proposal(&env, waitlist_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "ProposalPromoted"),),
+            (waitlist_id, proposal_id, current_time),
+        );
+
+        proposal_id
+    }
+
+    /// Get a waitlisted proposal by ID
+    pub fn get_waitlist_proposal(env: Env, waitlist_id: u64) -> Option<WaitlistProposal> {
+        get_waitlist_proposal(&env, waitlist_id)
+    }
+
+    /// Cancel a waitlisted proposal and refund deposit
+    pub fn cancel_waitlist_proposal(env: Env, proposer: Address, waitlist_id: u64) {
+        proposer.require_auth();
+
+        let waitlist_proposal = get_waitlist_proposal(&env, waitlist_id)
+            .expect("Waitlisted proposal not found");
+
+        if waitlist_proposal.proposer != proposer {
+            panic!("Only the proposer can cancel");
+        }
+
+        // Refund deposit
+        let governance_token = get_governance_token(&env);
+        let token_client = token::Client::new(&env, &governance_token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(
+            &contract_address,
+            &proposer,
+            &(waitlist_proposal.deposit_amount as i128),
+        );
+
+        remove_waitlist_proposal(&env, waitlist_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "ProposalWaitlistCancelled"),),
+            (waitlist_id, proposer),
+        );
+    }
+
     /// Get voting power for an address
     pub fn get_vote_power(env: Env, address: Address) -> u128 {
         let governance_token = get_governance_token(&env);

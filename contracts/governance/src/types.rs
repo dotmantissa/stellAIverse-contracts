@@ -111,3 +111,17 @@ pub struct Vote {
     pub weight: u128,
     pub timestamp: u64,
 }
+
+/// Waitlist for governance proposals
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct WaitlistProposal {
+    pub waitlist_id: u64,
+    pub proposer: Address,
+    pub title: String,
+    pub description: String,
+    pub proposal_type: ProposalType,
+    pub parameters: ProposalParameters,
+    pub deposit_amount: u128,
+    pub submitted_at: u64,
+}
