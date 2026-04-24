@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
-use crate::types::{Delegation, Proposal, Vote, VoteEscrow};
+use crate::types::{Delegation, Proposal, Vote, VoteEscrow, WaitlistProposal};
 
 #[contracttype]
 #[derive(Clone)]
@@ -14,6 +14,10 @@ pub enum DataKey {
     ProposalCounter,
     /// Proposal by ID
     Proposal(u64),
+    /// Waitlist proposal counter
+    WaitlistCounter,
+    /// Waitlist proposal by ID
+    WaitlistProposal(u64),
     /// Vote escrow for an address
     VoteEscrow(Address),
     /// Delegation from an address
@@ -88,6 +92,23 @@ pub fn increment_proposal_counter(env: &Env) -> u64 {
     counter
 }
 
+/* ---------------- WAITLIST COUNTER ---------------- */
+
+pub fn get_waitlist_counter(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::WaitlistCounter)
+        .unwrap_or(0)
+}
+
+pub fn increment_waitlist_counter(env: &Env) -> u64 {
+    let counter = get_waitlist_counter(env) + 1;
+    env.storage()
+        .instance()
+        .set(&DataKey::WaitlistCounter, &counter);
+    counter
+}
+
 /* ---------------- PROPOSALS ---------------- */
 
 pub fn set_proposal(env: &Env, proposal: &Proposal) {
@@ -100,6 +121,26 @@ pub fn get_proposal(env: &Env, proposal_id: u64) -> Option<Proposal> {
     env.storage()
         .instance()
         .get(&DataKey::Proposal(proposal_id))
+}
+
+/* ---------------- WAITLIST PROPOSALS ---------------- */
+
+pub fn set_waitlist_proposal(env: &Env, proposal: &WaitlistProposal) {
+    env.storage()
+        .instance()
+        .set(&DataKey::WaitlistProposal(proposal.waitlist_id), proposal);
+}
+
+pub fn get_waitlist_proposal(env: &Env, waitlist_id: u64) -> Option<WaitlistProposal> {
+    env.storage()
+        .instance()
+        .get(&DataKey::WaitlistProposal(waitlist_id))
+}
+
+pub fn remove_waitlist_proposal(env: &Env, waitlist_id: u64) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::WaitlistProposal(waitlist_id));
 }
 
 /* ---------------- VOTE ESCROW ---------------- */
