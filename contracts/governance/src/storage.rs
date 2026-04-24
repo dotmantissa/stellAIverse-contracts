@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
-use crate::types::{Delegation, Proposal, Vote, VoteEscrow, WaitlistProposal};
+use crate::types::{Delegation, DelegationSnapshot, Proposal, Vote, VoteEscrow, VotingMechanism, WaitlistProposal};
 
 #[contracttype]
 #[derive(Clone)]
@@ -24,6 +24,10 @@ pub enum DataKey {
     Delegation(Address),
     /// Delegators to an address (reverse index for efficient lookup)
     DelegatorsTo(Address),
+    /// Delegation snapshot for secure voting
+    DelegationSnapshot(u64), // proposal_id -> snapshot
+    /// Voting mechanism (linear/quadratic)
+    VotingMechanism,
     /// Vote record: (proposal_id, voter)
     Vote(u64, Address),
     /// Quorum threshold (basis points, default 3000 = 30%)
@@ -186,6 +190,31 @@ pub fn get_delegators_to(env: &Env, delegatee: &Address) -> Vec<Address> {
         .instance()
         .get(&DataKey::DelegatorsTo(delegatee.clone()))
         .unwrap_or_else(|| Vec::new(env))
+}
+
+pub fn set_delegation_snapshot(env: &Env, proposal_id: u64, snapshot: &DelegationSnapshot) {
+    env.storage()
+        .instance()
+        .set(&DataKey::DelegationSnapshot(proposal_id), snapshot);
+}
+
+pub fn get_delegation_snapshot(env: &Env, proposal_id: u64) -> Option<DelegationSnapshot> {
+    env.storage()
+        .instance()
+        .get(&DataKey::DelegationSnapshot(proposal_id))
+}
+
+pub fn set_voting_mechanism(env: &Env, mechanism: &VotingMechanism) {
+    env.storage()
+        .instance()
+        .set(&DataKey::VotingMechanism, mechanism);
+}
+
+pub fn get_voting_mechanism(env: &Env) -> VotingMechanism {
+    env.storage()
+        .instance()
+        .get(&DataKey::VotingMechanism)
+        .unwrap_or(VotingMechanism::Linear) // Default to linear voting
 }
 
 pub(crate) fn add_delegator_to_list(env: &Env, delegatee: &Address, delegator: &Address) {

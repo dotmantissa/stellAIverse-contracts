@@ -10,6 +10,16 @@ pub enum VoteType {
     Abstain,
 }
 
+/// Voting mechanism types
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VotingMechanism {
+    /// Linear voting (1 token = 1 vote)
+    Linear,
+    /// Quadratic voting (sqrt of tokens)
+    Quadratic,
+}
+
 /// Types of proposals that can be created
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +109,24 @@ pub struct Delegation {
     pub delegatee: Address,
     /// Amount of voting power delegated
     pub amount: u128,
+    /// Timestamp when delegation was created
+    pub created_at: u64,
+    /// Optional expiry timestamp for delegation
+    pub expires_at: Option<u64>,
+    /// Whether delegation is currently active
+    pub active: bool,
+}
+
+/// Delegation snapshot for secure delegation
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DelegationSnapshot {
+    /// Block number when snapshot was taken
+    pub block_number: u64,
+    /// Total delegated power at snapshot time
+    pub total_delegated_power: u128,
+    /// Delegators and their amounts at snapshot time
+    pub delegator_powers: Vec<(Address, u128)>,
 }
 
 /// Vote record for a user on a proposal
@@ -109,6 +137,7 @@ pub struct Vote {
     pub voter: Address,
     pub vote_type: VoteType,
     pub weight: u128,
+    pub voting_power_used: u128, // Raw voting power before quadratic calculation
     pub timestamp: u64,
 }
 
