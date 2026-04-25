@@ -31,6 +31,15 @@ const LOCK_PERIOD_SECONDS: u64 = 7 * DAY_IN_SECONDS;
 const REWARD_PERIOD_SECONDS: u64 = 30 * DAY_IN_SECONDS;
 const BONUS_PERCENT_PER_MONTH: i128 = 5;
 
+/// Governance vote count thresholds for multiplier tiers (issue #136).
+/// Stakers who have cast ≥ threshold votes in the last month receive the multiplier.
+const MULTIPLIER_TIER1_VOTES: u32 = 1;  // ≥1 vote  → 1.25× (125 bps)
+const MULTIPLIER_TIER2_VOTES: u32 = 5;  // ≥5 votes → 1.50× (150 bps)
+const MULTIPLIER_TIER3_VOTES: u32 = 10; // ≥10 votes → 2.00× (200 bps)
+
+/// Storage key for per-user governance vote count (set by governance contract or admin).
+const GOV_VOTES_KEY: &str = "gov_votes";
+
 #[contractimpl]
 impl StakingBonuses {
     /// Initialize the contract with an admin address.
@@ -43,6 +52,52 @@ impl StakingBonuses {
             .instance()
             .set(&Symbol::new(&env, ADMIN_KEY), &admin_addr);
         Ok(())
+    }
+
+    /// Record governance participation for a user (called by admin / governance contract).
+    /// `vote_count` is the number of governance votes cast in the current monthly window.
+    pub fn record_governance_votes(
+        env: Env,
+        caller: Address,
+        user: Address,
+        vote_count: u32,
+    ) -> Result<(), ContractError> {
+        // Only admin may update governance vote counts.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, ADMIN_KEY))
+            .ok_or(ContractError::Unauthorized)?;
+        if caller != admin {
+            return Err(ContractError::Unauthorized);
+        }
+        caller.require_auth();
+        let key = (Symbol::new(&env, GOV_VOTES_KEY), user.clone());
+        env.storage().instance().set(&key, &vote_count);
+        env.events().publish(
+            (
+                Symbol::new(&env, "staking"),
+                Symbol::new(&env, "gov_votes_recorded"),
+            ),
+            (user, vote_count),
+        );
+        Ok(())
+    }
+
+    /// Return the governance-activity multiplier for a user in basis points (100 = 1×).
+    /// Tier 1 (≥1 vote): 125 bps, Tier 2 (≥5 votes): 150 bps, Tier 3 (≥10 votes): 200 bps.
+    pub fn get_governance_multiplier(env: Env, user: Address) -> u32 {
+        let key = (Symbol::new(&env, GOV_VOTES_KEY), user);
+        let votes: u32 = env.storage().instance().get(&key).unwrap_or(0);
+        if votes >= MULTIPLIER_TIER3_VOTES {
+            200
+        } else if votes >= MULTIPLIER_TIER2_VOTES {
+            150
+        } else if votes >= MULTIPLIER_TIER1_VOTES {
+            125
+        } else {
+            100
+        }
     }
 
     /// Stake a specific token on behalf of `user`.
@@ -68,7 +123,7 @@ impl StakingBonuses {
             earned: 0,
         });
 
-        Self::accrue_rewards(&mut info, now)?;
+        Self::accrue_rewards(&env, &mut info, now, &user)?;
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&user, &env.current_contract_address(), &amount);
@@ -99,7 +154,7 @@ impl StakingBonuses {
             None => return 0,
         };
 
-        Self::accrue_rewards(&mut info, env.ledger().timestamp()).unwrap_or(());
+        Self::accrue_rewards(&env, &mut info, env.ledger().timestamp(), &user).unwrap_or(());
         info.earned
     }
 
@@ -110,7 +165,7 @@ impl StakingBonuses {
         let now = env.ledger().timestamp();
         let key = Self::stake_key(&user, &token);
         let mut info = Self::load_stake(&env, &key).ok_or(ContractError::StakeNotFound)?;
-        Self::accrue_rewards(&mut info, now)?;
+        Self::accrue_rewards(&env, &mut info, now, &user)?;
 
         let bonus = info.earned;
         info.earned = 0;
@@ -139,7 +194,7 @@ impl StakingBonuses {
             return Err(ContractError::StakeLocked);
         }
 
-        Self::accrue_rewards(&mut info, now)?;
+        Self::accrue_rewards(&env, &mut info, now, &user)?;
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&env.current_contract_address(), &user, &info.amt);
@@ -173,7 +228,12 @@ impl StakingBonuses {
         env.storage().instance().get(key)
     }
 
-    fn accrue_rewards(info: &mut StakeInfo, now: u64) -> Result<(), ContractError> {
+    fn accrue_rewards(
+        env: &Env,
+        info: &mut StakeInfo,
+        now: u64,
+        user: &Address,
+    ) -> Result<(), ContractError> {
         let elapsed = now.saturating_sub(info.last_ts);
         let periods = elapsed / REWARD_PERIOD_SECONDS;
         if periods == 0 {
@@ -181,13 +241,17 @@ impl StakingBonuses {
         }
 
         let periods_i = periods as i128;
+        // Apply governance multiplier (basis points, 100 = 1×).
+        let multiplier = Self::get_governance_multiplier(env.clone(), user.clone()) as i128;
         let reward = info
             .amt
             .checked_mul(BONUS_PERCENT_PER_MONTH)
             .ok_or(ContractError::OverflowError)?
             .checked_mul(periods_i)
             .ok_or(ContractError::OverflowError)?
-            .checked_div(100)
+            .checked_mul(multiplier)
+            .ok_or(ContractError::OverflowError)?
+            .checked_div(100 * 100) // percent × bps
             .ok_or(ContractError::OverflowError)?;
 
         info.earned = info
@@ -301,6 +365,7 @@ mod tests {
 
         env.ledger().set_timestamp(31 * DAY_IN_SECONDS);
 
+        // No governance votes → 100 bps multiplier → 5% * 100/100 = 5%
         assert_eq!(client.calculate_bonus(&user, &token_a), 50);
         assert_eq!(client.calculate_bonus(&user, &token_b), 100);
 
@@ -329,5 +394,58 @@ mod tests {
 
         assert_eq!(client.get_stake_info(&user, &token_a), None);
         assert_eq!(client.get_stake_info(&user, &token_b), None);
+    }
+
+    #[test]
+    fn test_governance_multiplier_tiers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, StakingBonuses);
+        let client = StakingBonusesClient::new(&env, &contract_id);
+        client.init_contract(&admin);
+
+        // No votes → base multiplier 100 bps
+        assert_eq!(client.get_governance_multiplier(&user), 100);
+
+        // 1 vote → tier 1: 125 bps
+        client.record_governance_votes(&admin, &user, &1);
+        assert_eq!(client.get_governance_multiplier(&user), 125);
+
+        // 5 votes → tier 2: 150 bps
+        client.record_governance_votes(&admin, &user, &5);
+        assert_eq!(client.get_governance_multiplier(&user), 150);
+
+        // 10 votes → tier 3: 200 bps
+        client.record_governance_votes(&admin, &user, &10);
+        assert_eq!(client.get_governance_multiplier(&user), 200);
+    }
+
+    #[test]
+    fn test_governance_multiplier_applied_to_rewards() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let token = setup_token(&env, &admin);
+        let token_client = MockTokenClient::new(&env, &token);
+        token_client.mint(&user, &10_000);
+
+        let contract_id = env.register_contract(None, StakingBonuses);
+        let client = StakingBonusesClient::new(&env, &contract_id);
+        client.init_contract(&admin);
+
+        // Give user tier-3 multiplier (200 bps = 2×)
+        client.record_governance_votes(&admin, &user, &10);
+
+        client.stake(&user, &token, &1_000);
+        env.ledger().set_timestamp(31 * DAY_IN_SECONDS);
+
+        // 5% * 2× = 10% of 1000 = 100
+        assert_eq!(client.calculate_bonus(&user, &token), 100);
     }
 }
