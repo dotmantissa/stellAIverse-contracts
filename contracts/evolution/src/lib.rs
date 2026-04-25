@@ -10,6 +10,7 @@ use soroban_sdk::{contract, contractimpl, Address, Env, String, Symbol, Vec};
 use stellai_lib::{
     admin,
     audit::{create_audit_log, OperationType},
+    rbac,
     storage_keys::REQUEST_COUNTER_KEY,
     types::{EvolutionRequest, EvolutionStatus},
     ADMIN_KEY,
@@ -111,9 +112,11 @@ impl Evolution {
     /// Execute an evolution request (Admin only)
     /// This approves the request and records the history.
     pub fn execute_evolution(env: Env, request_id: u64, from_stage: u32, to_stage: u32) {
-        // 1. Verify Admin Auth
+        // 1. Verify Admin Auth — re-reads from storage, no implicit trust (Issue #152)
         let admin: Address = admin::get_admin(&env).unwrap();
         admin.require_auth();
+        rbac::require_admin(&env, &admin)
+            .unwrap_or_else(|_| panic!("Unauthorized: caller is not admin"));
 
         // 2. Get the request
         let request_key = (Symbol::new(&env, "request"), request_id);

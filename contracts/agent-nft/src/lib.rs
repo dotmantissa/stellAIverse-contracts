@@ -10,6 +10,7 @@ use stellai_lib::{
     admin,
     audit::{create_audit_log, OperationType},
     errors::ContractError,
+    rbac,
     storage_keys::{AGENT_COUNTER_KEY, APPROVED_MINTERS_KEY},
     types::{Agent, OptionalRoyaltyInfo, RoyaltyInfo},
     validation, ADMIN_KEY,
@@ -121,73 +122,36 @@ impl AgentNFT {
         Ok(())
     }
 
-    /// Verify caller is admin
+    /// Verify caller is admin — always re-reads from storage (Issue #152)
     fn verify_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
-        if admin::verify_admin(env, caller).is_err() {
-            // Log the authorization failure
-            let before_state = String::from_str(&env, "{}");
-            let after_state = String::from_str(&env, "{}");
-            let tx_hash = String::from_str(&env, "verify_admin_fail"); // Placeholder
-            let description = Some(String::from_str(&env, "Admin verification failed."));
-
+        rbac::require_admin(env, caller).map_err(|_| {
             let _ = create_audit_log(
-                &env,
+                env,
                 caller.clone(),
                 OperationType::AuthFailure,
-                before_state,
-                after_state,
-                tx_hash,
-                description,
+                String::from_str(env, "{}"),
+                String::from_str(env, "{}"),
+                String::from_str(env, "verify_admin_fail"),
+                Some(String::from_str(env, "Admin verification failed.")),
             );
-            return Err(ContractError::Unauthorized);
-        }
-        Ok(())
+            ContractError::Unauthorized
+        })
     }
 
-    /// Verify caller is admin or approved minter
+    /// Verify caller is admin or approved minter — always re-reads from storage (Issue #152)
     fn verify_minter(env: &Env, caller: &Address) -> Result<(), ContractError> {
-        // Check if admin
-        if let Some(admin) = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&Symbol::new(env, ADMIN_KEY))
-        {
-            if caller == &admin {
-                return Ok(());
-            }
-        }
-
-        // Check if approved minter
-        let approved_minters: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(env, APPROVED_MINTERS_KEY))
-            .unwrap_or_else(|| Vec::new(env));
-
-        for i in 0..approved_minters.len() {
-            if let Some(minter) = approved_minters.get(i) {
-                if &minter == caller {
-                    return Ok(());
-                }
-            }
-        }
-
-        // If we reach here, no match was found.
-        let before_state = String::from_str(&env, "{}");
-        let after_state = String::from_str(&env, "{}");
-        let tx_hash = String::from_str(&env, "verify_minter_fail"); // Placeholder
-        let description = Some(String::from_str(&env, "Minter verification failed."));
-
-        let _ = create_audit_log(
-            &env,
-            caller.clone(),
-            OperationType::AuthFailure,
-            before_state,
-            after_state,
-            tx_hash,
-            description,
-        );
-        Err(ContractError::Unauthorized)
+        rbac::require_minter(env, caller).map_err(|_| {
+            let _ = create_audit_log(
+                env,
+                caller.clone(),
+                OperationType::AuthFailure,
+                String::from_str(env, "{}"),
+                String::from_str(env, "{}"),
+                String::from_str(env, "verify_minter_fail"),
+                Some(String::from_str(env, "Minter verification failed.")),
+            );
+            ContractError::Unauthorized
+        })
     }
 
     /// Safe addition with overflow checks

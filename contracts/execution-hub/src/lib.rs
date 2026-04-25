@@ -7,7 +7,7 @@ use soroban_sdk::{
 #[cfg(test)]
 mod prop_tests;
 use stellai_lib::{
-    admin, errors::ContractError, storage_keys::EXEC_CTR_KEY, validation, AnomalyScore,
+    admin, errors::ContractError, rbac, storage_keys::EXEC_CTR_KEY, validation, AnomalyScore,
     AnomalySeverity, BehaviorProfile, ProposalStatus, ThresholdKeyShare, ThresholdProposal,
     ADMIN_KEY, DEFAULT_RATE_LIMIT_OPERATIONS, DEFAULT_RATE_LIMIT_WINDOW_SECONDS, MAX_DATA_SIZE,
     MAX_HISTORY_QUERY_LIMIT, MAX_HISTORY_SIZE, MAX_STRING_LENGTH,
@@ -183,7 +183,7 @@ impl ExecutionHub {
         owner.require_auth();
         Self::validate_agent_id(agent_id);
 
-        // Verify owner via AgentNFT
+        // Re-validate owner from storage — no implicit trust (Issue #152)
         let actual_owner = Self::get_agent_owner(&env, agent_id);
         if owner != actual_owner {
             panic!("Unauthorized: caller is not agent owner");
@@ -210,7 +210,7 @@ impl ExecutionHub {
         owner.require_auth();
         Self::validate_agent_id(agent_id);
 
-        // Verify owner via AgentNFT
+        // Re-validate owner from storage — no implicit trust (Issue #152)
         let actual_owner = Self::get_agent_owner(&env, agent_id);
         if owner != actual_owner {
             panic!("Unauthorized: caller is not agent owner");
@@ -259,30 +259,26 @@ impl ExecutionHub {
 
         Self::validate_agent_id(agent_id);
 
-        // Permission Check: Owner or Authorized Operator
-        // 1. Check if executor is owner
-        let owner = Self::get_agent_owner(&env, agent_id);
-        let is_owner = executor == owner;
-
-        // 2. If not owner, check if authorized operator
-        if !is_owner {
-            let op_key = symbol_short!("op");
-            let agent_op_key = (op_key, agent_id);
-            if let Some(op_data) = env
-                .storage()
-                .instance()
-                .get::<_, OperatorData>(&agent_op_key)
-            {
-                if op_data.operator != executor {
-                    panic!("Unauthorized: executor is not owner or operator");
-                }
-                if env.ledger().timestamp() > op_data.expires_at {
-                    panic!("Unauthorized: operator authorization expired");
-                }
-            } else {
-                panic!("Unauthorized: executor is not owner or operator");
-            }
-        }
+        // Permission Check: re-validate owner/operator from storage (Issue #152)
+        // No implicit trust — rbac::require_owner_or_operator reads storage directly.
+        rbac::require_owner_or_operator(
+            &env,
+            &executor,
+            agent_id,
+            |e, id| {
+                let owner = Self::get_agent_owner(e, id);
+                Some(owner)
+            },
+            |e, id| {
+                let op_key = symbol_short!("op");
+                let agent_op_key = (op_key, id);
+                e.storage()
+                    .instance()
+                    .get::<_, OperatorData>(&agent_op_key)
+                    .map(|d| (d.operator, d.expires_at))
+            },
+        )
+        .unwrap_or_else(|_| panic!("Unauthorized: executor is not owner or operator"));
         Self::validate_string_length(&action, "Action name");
         Self::validate_data_size(&parameters, "Parameters");
         Self::validate_data_size(&execution_hash, "Execution hash");
@@ -549,11 +545,10 @@ impl ExecutionHub {
             .publish((symbol_short!("adm_xfer"),), (current_admin, new_admin));
     }
 
-    // Helper: verify admin
+    // Helper: verify admin — always re-reads from storage (Issue #152)
     fn verify_admin(env: &Env, caller: &Address) {
-        if admin::verify_admin(env, caller) == Err(ContractError::Unauthorized) {
-            panic!("Unauthorized: caller is not admin");
-        }
+        rbac::require_admin(env, caller)
+            .unwrap_or_else(|_| panic!("Unauthorized: caller is not admin"));
     }
 
     // Helper: validate rate limit config (ops and window must be positive)

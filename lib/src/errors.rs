@@ -27,4 +27,7 @@ pub enum ContractError {
     InvalidRoyaltyFee = 17,
     MetadataTooLong = 18,
     CapabilitiesExceeded = 19,
+    /// Returned when an indirect or internal call attempts to escalate
+    /// privileges beyond what is stored on-chain for the caller (Issue #152).
+    RoleEscalationAttempt = 20,
 }

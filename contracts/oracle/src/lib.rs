@@ -10,6 +10,7 @@ use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, S
 use stellai_lib::{
     admin,
     audit::{create_audit_log, OperationType},
+    rbac,
     storage_keys::PROVIDER_LIST_KEY,
     types::OracleData,
     ADMIN_KEY,
@@ -40,25 +41,15 @@ impl Oracle {
             .set(&Symbol::new(&env, PROVIDER_LIST_KEY), &providers);
     }
 
+    /// Verify admin — always re-reads from storage (Issue #152)
     fn verify_admin(env: &Env, caller: &Address) {
-        if admin::verify_admin(env, caller).is_err() {
-            panic!("Caller is not admin");
-        }
+        rbac::require_admin(env, caller)
+            .unwrap_or_else(|_| panic!("Caller is not admin"));
     }
 
+    /// Check provider is registered — always re-reads from storage (Issue #152)
     fn is_authorized_provider(env: &Env, provider: &Address) -> bool {
-        let providers: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(env, PROVIDER_LIST_KEY))
-            .unwrap_or_else(|| Vec::new(env));
-
-        for p in providers.iter() {
-            if &p == provider {
-                return true;
-            }
-        }
-        false
+        rbac::require_oracle_provider(env, provider, PROVIDER_LIST_KEY).is_ok()
     }
 
     pub fn register_provider(env: Env, admin: Address, provider: Address) {

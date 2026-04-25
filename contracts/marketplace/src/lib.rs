@@ -14,6 +14,7 @@ use soroban_sdk::{contract, contractimpl, token, Address, Bytes, Env, String, Sy
 use stellai_lib::{
     atomic::AtomicTransactionSupport,
     audit::{create_audit_log, OperationType},
+    rbac,
     storage_keys::LISTING_COUNTER_KEY,
     types::{
         Approval, ApprovalConfig, ApprovalHistory, ApprovalStatus, Auction, AuctionStatus,
@@ -62,13 +63,7 @@ impl Marketplace {
     /// Set the payment token
     pub fn set_payment_token(env: Env, admin: Address, token: Address) {
         admin.require_auth();
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
-
+        Self::verify_admin(&env, &admin);
         set_payment_token(&env, token);
     }
 
@@ -76,13 +71,7 @@ impl Marketplace {
     pub fn set_platform_fee(env: Env, admin: Address, fee_bps: u32) {
         admin.require_auth();
         assert!(fee_bps <= 5000, "Platform fee cannot exceed 50%");
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
-
+        Self::verify_admin(&env, &admin);
         storage::set_platform_fee(&env, fee_bps);
         env.events()
             .publish((Symbol::new(&env, "platform_fee_updated"),), (fee_bps,));
@@ -91,6 +80,12 @@ impl Marketplace {
     /// Get the configured platform fee.
     pub fn get_platform_fee(env: Env) -> u32 {
         storage::get_platform_fee(&env)
+    }
+
+    /// Internal: verify caller is the stored admin — always re-reads from storage (Issue #152)
+    fn verify_admin(env: &Env, caller: &Address) {
+        rbac::require_admin(env, caller)
+            .unwrap_or_else(|_| panic!("Unauthorized"));
     }
 
     /// Create a new listing
@@ -359,12 +354,7 @@ impl Marketplace {
         total_approvers: u32,
         ttl_seconds: u64,
     ) {
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
+        Self::verify_admin(&env, &admin);
 
         assert!(threshold > 0, "Threshold must be positive");
         assert!(
@@ -1410,12 +1400,7 @@ impl Marketplace {
         admin.require_auth();
 
         // Verify admin is the contract admin
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
+        Self::verify_admin(&env, &admin);
 
         assert!(base_marketplace_fee <= 5000, "Base fee cannot exceed 50%");
         assert!(min_fee_bps >= 5, "Min fee cannot be below 0.05%");
@@ -1457,12 +1442,7 @@ impl Marketplace {
         admin.require_auth();
 
         // Verify admin is the contract admin
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
+        Self::verify_admin(&env, &admin);
 
         assert!(!oracle_ids.is_empty(), "Must provide at least one oracle");
         assert!(oracle_ids.len() <= 10, "Too many oracles");
@@ -2008,12 +1988,7 @@ impl Marketplace {
         deposit_bps: u32,
         early_termination_penalty_bps: u32,
     ) {
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
+        Self::verify_admin(&env, &admin);
 
         assert!(deposit_bps <= 5000, "Deposit cannot exceed 50%");
         assert!(
@@ -2436,12 +2411,7 @@ impl Marketplace {
         max_fee_bps: u32,
         adjustment_window: u64,
     ) {
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
+        Self::verify_admin(&env, &admin);
 
         assert!(min_fee_bps < max_fee_bps, "Min fee must be less than max fee");
         assert!(max_fee_bps <= 10000, "Max fee cannot exceed 100%");
@@ -2741,12 +2711,7 @@ impl Marketplace {
 
     /// Force fee update (admin only, bypasses timing restrictions)
     pub fn force_fee_update(env: Env, admin: Address) -> Result<u32, &'static str> {
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
+        Self::verify_admin(&env, &admin);
 
         // Temporarily bypass timing check by setting last update to 0
         let old_last_update = storage::get_last_oracle_update(&env);
@@ -2766,12 +2731,7 @@ impl Marketplace {
 
     /// Set credit score NFT contract address (admin only)
     pub fn set_credit_score_nft_contract(env: Env, admin: Address, nft_contract: Address) {
-        let current_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Contract not initialized");
-        assert!(admin == current_admin, "Unauthorized");
+        Self::verify_admin(&env, &admin);
 
         env.storage()
             .instance()
