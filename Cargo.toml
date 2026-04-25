@@ -2,6 +2,8 @@
 members = [
     "contracts/governance",
     "contracts/staking-bonuses",
+    "contracts/compliance-integration",
+    "contracts/referral-rewards",
     "lib",
     "shared",
 ]
