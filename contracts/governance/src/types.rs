@@ -186,3 +186,97 @@ pub struct MultisigConfig {
     /// Whether multisig is enabled for this contract
     pub enabled: bool,
 }
+
+/// Timelock queue entry for governance parameter updates
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TimelockEntry {
+    /// Unique identifier for the timelock entry
+    pub entry_id: u64,
+    /// Associated proposal ID
+    pub proposal_id: u64,
+    /// Target contract address
+    pub target_contract: Address,
+    /// Target function name
+    pub target_function: Symbol,
+    /// Arguments for the target function
+    pub target_args: Vec<Val>,
+    /// When the entry was queued (timestamp)
+    pub queued_at: u64,
+    /// When the entry becomes executable (timestamp)
+    pub executable_at: u64,
+    /// Whether the entry has been executed
+    pub executed: bool,
+    /// Whether the entry was cancelled
+    pub cancelled: bool,
+    /// Who queued this entry
+    pub queued_by: Address,
+}
+
+/// Timelock configuration
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TimelockConfig {
+    /// Minimum delay before execution (in seconds)
+    pub min_delay: u64,
+    /// Maximum delay before execution (in seconds)
+    pub max_delay: u64,
+    /// Default delay if not specified (in seconds)
+    pub default_delay: u64,
+    /// Whether timelock is enabled
+    pub enabled: bool,
+}
+
+/// Parameter validation rules
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ParameterRule {
+    /// Parameter name
+    pub name: String,
+    /// Minimum allowed value (as string)
+    pub min_value: Option<String>,
+    /// Maximum allowed value (as string)
+    pub max_value: Option<String>,
+    /// Allowed values (enum-like)
+    pub allowed_values: Option<Vec<String>>,
+    /// Whether this parameter requires timelock
+    pub requires_timelock: bool,
+    /// Parameter type for validation
+    pub param_type: ParameterType,
+}
+
+/// Parameter types for validation
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParameterType {
+    /// Unsigned integer
+    U64,
+    /// Unsigned 128-bit integer
+    U128,
+    /// Signed integer
+    I64,
+    /// Boolean
+    Bool,
+    /// String
+    String,
+    /// Address
+    Address,
+    /// Symbol
+    Symbol,
+}
+
+/// Storage snapshot for integrity validation
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StorageSnapshot {
+    /// Contract address
+    pub contract_address: Address,
+    /// Storage key
+    pub storage_key: Val,
+    /// Value before change
+    pub before_value: Option<Val>,
+    /// Value after change
+    pub after_value: Option<Val>,
+    /// Timestamp of snapshot
+    pub timestamp: u64,
+}

@@ -1,8 +1,11 @@
-/// RBAC (Role-Based Access Control) helpers — Issue #152
+/// RBAC (Role-Based Access Control) helpers — Issue #152, #178, #179
 ///
 /// All role checks read directly from on-chain storage on every call.
 /// No caller context is implicitly trusted; every internal or indirect
 /// call path must go through one of these functions.
+/// 
+/// Issue #179: Prevent Role Escalation via Indirect Function Calls
+/// Issue #178: Implement Role Separation Between Governance and KYC Operators
 use soroban_sdk::{Address, Env, Symbol, Vec};
 
 use crate::{errors::ContractError, ADMIN_KEY, APPROVED_MINTERS_KEY};
@@ -115,6 +118,237 @@ pub fn require_oracle_provider(
     }
 
     Err(ContractError::RoleEscalationAttempt)
+}
+
+// ── Enhanced Role Validation (Issue #179) ──────────────────────────────────────
+
+/// Validate caller role with explicit revalidation to prevent indirect escalation
+/// This function must be used for all internal calls that could be invoked indirectly
+pub fn validate_caller_role(
+    env: &Env,
+    caller: &Address,
+    required_role: RoleType,
+) -> Result<(), ContractError> {
+    // Always re-read from storage - never trust passed context
+    match required_role {
+        RoleType::Admin => require_admin(env, caller),
+        RoleType::Minter => require_minter(env, caller),
+        RoleType::Governance => require_governance_role(env, caller),
+        RoleType::KycOperator => require_kyc_operator_role(env, caller),
+    }
+}
+
+/// Enhanced admin check with explicit validation for indirect calls
+pub fn require_admin_indirect_safe(env: &Env, caller: &Address) -> Result<(), ContractError> {
+    // Re-read admin from storage and validate caller matches exactly
+    let admin = get_admin(env)?;
+    if caller != &admin {
+        return Err(ContractError::RoleEscalationAttempt);
+    }
+    Ok(())
+}
+
+/// Validate internal function calls to prevent escalation vectors
+pub fn validate_internal_call(
+    env: &Env,
+    caller: &Address,
+    function_name: &str,
+) -> Result<(), ContractError> {
+    // Log the access attempt for audit trail
+    env.events().publish(
+        (Symbol::new(env, "access_check"),),
+        (caller.clone(), function_name, env.ledger().timestamp()),
+    );
+    
+    // Always revalidate caller role from storage
+    require_admin_indirect_safe(env, caller)
+}
+
+// ── Role Separation (Issue #178) ───────────────────────────────────────────────
+
+/// Role types for separation of duties
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+pub enum RoleType {
+    Admin = 0,
+    Minter = 1,
+    Governance = 2,
+    KycOperator = 3,
+}
+
+/// Storage keys for role separation
+const GOVERNANCE_ROLE_KEY: &str = "governance_role";
+const KYC_OPERATOR_ROLE_KEY: &str = "kyc_operator_role";
+const ROLE_ASSIGNMENTS_KEY: &str = "role_assignments";
+
+/// Require governance role - mutually exclusive with KYC operator
+pub fn require_governance_role(env: &Env, caller: &Address) -> Result<(), ContractError> {
+    // Check if caller has governance role
+    let governance_roles: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, GOVERNANCE_ROLE_KEY))
+        .unwrap_or_else(|| Vec::new(env));
+
+    for role in governance_roles.iter() {
+        if &role == caller {
+            // Ensure caller does not also have KYC operator role
+            if has_kyc_operator_role(env, caller)? {
+                return Err(ContractError::RoleConflict);
+            }
+            return Ok(());
+        }
+    }
+
+    Err(ContractError::RoleEscalationAttempt)
+}
+
+/// Require KYC operator role - mutually exclusive with governance
+pub fn require_kyc_operator_role(env: &Env, caller: &Address) -> Result<(), ContractError> {
+    // Check if caller has KYC operator role
+    let kyc_operators: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY))
+        .unwrap_or_else(|| Vec::new(env));
+
+    for op in kyc_operators.iter() {
+        if &op == caller {
+            // Ensure caller does not also have governance role
+            if has_governance_role(env, caller)? {
+                return Err(ContractError::RoleConflict);
+            }
+            return Ok(());
+        }
+    }
+
+    Err(ContractError::RoleEscalationAttempt)
+}
+
+/// Check if address has governance role
+pub fn has_governance_role(env: &Env, address: &Address) -> Result<bool, ContractError> {
+    let governance_roles: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, GOVERNANCE_ROLE_KEY))
+        .unwrap_or_else(|| Vec::new(env));
+
+    Ok(governance_roles.iter().any(|role| role == address))
+}
+
+/// Check if address has KYC operator role
+pub fn has_kyc_operator_role(env: &Env, address: &Address) -> Result<bool, ContractError> {
+    let kyc_operators: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY))
+        .unwrap_or_else(|| Vec::new(env));
+
+    Ok(kyc_operators.iter().any(|op| op == address))
+}
+
+/// Assign governance role (admin only) - ensures mutual exclusion
+pub fn assign_governance_role(
+    env: &Env,
+    admin: &Address,
+    new_governance: &Address,
+) -> Result<(), ContractError> {
+    // Validate admin
+    require_admin(env, admin)?;
+    
+    // Remove from KYC operators if present
+    remove_from_kyc_operators(env, new_governance)?;
+    
+    // Add to governance roles
+    let mut governance_roles: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, GOVERNANCE_ROLE_KEY))
+        .unwrap_or_else(|| Vec::new(env));
+
+    if !governance_roles.iter().any(|role| role == new_governance) {
+        governance_roles.push_back(new_governance.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, GOVERNANCE_ROLE_KEY), &governance_roles);
+    }
+
+    Ok(())
+}
+
+/// Assign KYC operator role (admin only) - ensures mutual exclusion
+pub fn assign_kyc_operator_role(
+    env: &Env,
+    admin: &Address,
+    new_operator: &Address,
+) -> Result<(), ContractError> {
+    // Validate admin
+    require_admin(env, admin)?;
+    
+    // Remove from governance if present
+    remove_from_governance(env, new_operator)?;
+    
+    // Add to KYC operators
+    let mut kyc_operators: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY))
+        .unwrap_or_else(|| Vec::new(env));
+
+    if !kyc_operators.iter().any(|op| op == new_operator) {
+        kyc_operators.push_back(new_operator.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY), &kyc_operators);
+    }
+
+    Ok(())
+}
+
+/// Remove address from governance roles
+fn remove_from_governance(env: &Env, address: &Address) -> Result<(), ContractError> {
+    let mut governance_roles: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, GOVERNANCE_ROLE_KEY))
+        .unwrap_or_else(|| Vec::new(env));
+
+    governance_roles.retain(|role| role != address);
+    
+    if governance_roles.len() > 0 {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, GOVERNANCE_ROLE_KEY), &governance_roles);
+    } else {
+        env.storage()
+            .instance()
+            .remove(&Symbol::new(env, GOVERNANCE_ROLE_KEY));
+    }
+
+    Ok(())
+}
+
+/// Remove address from KYC operators
+fn remove_from_kyc_operators(env: &Env, address: &Address) -> Result<(), ContractError> {
+    let mut kyc_operators: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY))
+        .unwrap_or_else(|| Vec::new(env));
+
+    kyc_operators.retain(|op| op != address);
+    
+    if kyc_operators.len() > 0 {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY), &kyc_operators);
+    } else {
+        env.storage()
+            .instance()
+            .remove(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -335,6 +569,210 @@ mod tests {
                 .set(&Symbol::new(&env, "providers"), &list);
             let err = require_oracle_provider(&env, &attacker, "providers").unwrap_err();
             assert_eq!(err, ContractError::RoleEscalationAttempt);
+        });
+    }
+
+    // ── Enhanced Role Validation Tests (Issue #179) ───────────────────────────
+
+    #[test]
+    fn validate_caller_role_admin_success() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            assert!(validate_caller_role(&env, &admin, RoleType::Admin).is_ok());
+        });
+    }
+
+    #[test]
+    fn validate_caller_role_indirect_escalation_fails() {
+        let (env, cid) = setup();
+        let real_admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &real_admin);
+            let err = validate_caller_role(&env, &attacker, RoleType::Admin).unwrap_err();
+            assert_eq!(err, ContractError::RoleEscalationAttempt);
+        });
+    }
+
+    #[test]
+    fn validate_internal_call_logs_access_attempt() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            assert!(validate_internal_call(&env, &admin, "test_function").is_ok());
+        });
+    }
+
+    // ── Role Separation Tests (Issue #178) ───────────────────────────────────────
+
+    #[test]
+    fn assign_governance_role_success() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        let governance = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            assert!(assign_governance_role(&env, &admin, &governance).is_ok());
+            assert!(has_governance_role(&env, &governance).unwrap());
+            assert!(!has_kyc_operator_role(&env, &governance).unwrap());
+        });
+    }
+
+    #[test]
+    fn assign_kyc_operator_role_success() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        let kyc_op = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            assert!(assign_kyc_operator_role(&env, &admin, &kyc_op).is_ok());
+            assert!(has_kyc_operator_role(&env, &kyc_op).unwrap());
+            assert!(!has_governance_role(&env, &kyc_op).unwrap());
+        });
+    }
+
+    #[test]
+    fn role_mutual_exclusion_governance_to_kyc() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            
+            // First assign governance role
+            assert!(assign_governance_role(&env, &admin, &user).is_ok());
+            assert!(has_governance_role(&env, &user).unwrap());
+            
+            // Then assign KYC operator - should remove governance role
+            assert!(assign_kyc_operator_role(&env, &admin, &user).is_ok());
+            assert!(has_kyc_operator_role(&env, &user).unwrap());
+            assert!(!has_governance_role(&env, &user).unwrap());
+        });
+    }
+
+    #[test]
+    fn role_mutual_exclusion_kyc_to_governance() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            
+            // First assign KYC operator role
+            assert!(assign_kyc_operator_role(&env, &admin, &user).is_ok());
+            assert!(has_kyc_operator_role(&env, &user).unwrap());
+            
+            // Then assign governance - should remove KYC operator role
+            assert!(assign_governance_role(&env, &admin, &user).is_ok());
+            assert!(has_governance_role(&env, &user).unwrap());
+            assert!(!has_kyc_operator_role(&env, &user).unwrap());
+        });
+    }
+
+    #[test]
+    fn require_governance_role_rejects_kyc_operator() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        let kyc_op = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            
+            // Assign KYC operator role
+            assert!(assign_kyc_operator_role(&env, &admin, &kyc_op).is_ok());
+            
+            // Try to use governance functions - should fail
+            let err = require_governance_role(&env, &kyc_op).unwrap_err();
+            assert_eq!(err, ContractError::RoleConflict);
+        });
+    }
+
+    #[test]
+    fn require_kyc_operator_role_rejects_governance() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        let governance = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            
+            // Assign governance role
+            assert!(assign_governance_role(&env, &admin, &governance).is_ok());
+            
+            // Try to use KYC functions - should fail
+            let err = require_kyc_operator_role(&env, &governance).unwrap_err();
+            assert_eq!(err, ContractError::RoleConflict);
+        });
+    }
+
+    #[test]
+    fn role_assignment_requires_admin() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            
+            // Attacker tries to assign roles - should fail
+            let err = assign_governance_role(&env, &attacker, &user).unwrap_err();
+            assert_eq!(err, ContractError::RoleEscalationAttempt);
+            
+            let err = assign_kyc_operator_role(&env, &attacker, &user).unwrap_err();
+            assert_eq!(err, ContractError::RoleEscalationAttempt);
+        });
+    }
+
+    #[test]
+    fn dual_role_assignment_prevented() {
+        let (env, cid) = setup();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, ADMIN_KEY), &admin);
+            
+            // Manually try to set both roles (bypass assignment functions)
+            let mut governance_roles: Vec<Address> = Vec::new(&env);
+            governance_roles.push_back(user.clone());
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, GOVERNANCE_ROLE_KEY), &governance_roles);
+            
+            let mut kyc_operators: Vec<Address> = Vec::new(&env);
+            kyc_operators.push_back(user.clone());
+            env.storage()
+                .instance()
+                .set(&Symbol::new(&env, KYC_OPERATOR_ROLE_KEY), &kyc_operators);
+            
+            // Both role checks should fail due to conflict
+            let err = require_governance_role(&env, &user).unwrap_err();
+            assert_eq!(err, ContractError::RoleConflict);
+            
+            let err = require_kyc_operator_role(&env, &user).unwrap_err();
+            assert_eq!(err, ContractError::RoleConflict);
         });
     }
 }

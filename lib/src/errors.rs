@@ -42,9 +42,10 @@ pub enum ContractError {
     Unauthorized = 100,
     NotOwner = 101,
     RoleEscalationAttempt = 102,
-    InsufficientPermissions = 103,
-    InvalidSignature = 104,
-    SignatureExpired = 105,
+    RoleConflict = 103,
+    InsufficientPermissions = 104,
+    InvalidSignature = 105,
+    SignatureExpired = 106,
     
     // State Machine & Lifecycle (200-299)
     InvalidStateTransition = 200,

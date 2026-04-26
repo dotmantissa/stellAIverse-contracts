@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
-use crate::types::{Delegation, DelegationSnapshot, MultisigApproval, MultisigConfig, Proposal, Vote, VoteEscrow, VotingMechanism, WaitlistProposal};
+use crate::types::{Delegation, DelegationSnapshot, MultisigApproval, MultisigConfig, ParameterRule, Proposal, StorageSnapshot, TimelockConfig, TimelockEntry, Vote, VoteEscrow, VotingMechanism, WaitlistProposal};
 
 #[contracttype]
 #[derive(Clone)]
@@ -46,6 +46,16 @@ pub enum DataKey {
     MultisigApproval(u64),
     /// Multisig configuration
     MultisigConfig,
+    /// Timelock configuration
+    TimelockConfig,
+    /// Timelock entry counter
+    TimelockCounter,
+    /// Timelock entry by ID
+    TimelockEntry(u64),
+    /// Parameter validation rules
+    ParameterRule(String), // parameter name -> rule
+    /// Storage snapshot for integrity validation
+    StorageSnapshot(Address, Val), // contract_address, storage_key
 }
 
 /* ---------------- ADMIN ---------------- */
@@ -404,4 +414,91 @@ pub fn is_authorized_signer(env: &Env, signer: &Address) -> bool {
 /// Check if multisig approval has reached threshold
 pub fn has_reached_threshold(approval: &MultisigApproval) -> bool {
     approval.approvers.len() >= approval.required_approvals
+}
+
+/* ---------------- TIMELOCK ---------------- */
+
+pub fn set_timelock_config(env: &Env, config: &TimelockConfig) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TimelockConfig, config);
+}
+
+pub fn get_timelock_config(env: &Env) -> Option<TimelockConfig> {
+    env.storage()
+        .instance()
+        .get(&DataKey::TimelockConfig)
+}
+
+pub fn get_timelock_counter(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TimelockCounter)
+        .unwrap_or(0)
+}
+
+pub fn increment_timelock_counter(env: &Env) -> u64 {
+    let counter = get_timelock_counter(env) + 1;
+    env.storage()
+        .instance()
+        .set(&DataKey::TimelockCounter, &counter);
+    counter
+}
+
+pub fn set_timelock_entry(env: &Env, entry: &TimelockEntry) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TimelockEntry(entry.entry_id), entry);
+}
+
+pub fn get_timelock_entry(env: &Env, entry_id: u64) -> Option<TimelockEntry> {
+    env.storage()
+        .instance()
+        .get(&DataKey::TimelockEntry(entry_id))
+}
+
+pub fn remove_timelock_entry(env: &Env, entry_id: u64) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::TimelockEntry(entry_id));
+}
+
+/* ---------------- PARAMETER VALIDATION ---------------- */
+
+pub fn set_parameter_rule(env: &Env, rule: &ParameterRule) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ParameterRule(rule.name.clone()), rule);
+}
+
+pub fn get_parameter_rule(env: &Env, parameter_name: &str) -> Option<ParameterRule> {
+    env.storage()
+        .instance()
+        .get(&DataKey::ParameterRule(String::from_str(env, parameter_name)))
+}
+
+pub fn remove_parameter_rule(env: &Env, parameter_name: &str) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::ParameterRule(String::from_str(env, parameter_name)));
+}
+
+/* ---------------- STORAGE SNAPSHOTS ---------------- */
+
+pub fn set_storage_snapshot(env: &Env, snapshot: &StorageSnapshot) {
+    env.storage()
+        .instance()
+        .set(&DataKey::StorageSnapshot(snapshot.contract_address.clone(), snapshot.storage_key.clone()), snapshot);
+}
+
+pub fn get_storage_snapshot(env: &Env, contract_address: &Address, storage_key: &Val) -> Option<StorageSnapshot> {
+    env.storage()
+        .instance()
+        .get(&DataKey::StorageSnapshot(contract_address.clone(), storage_key.clone()))
+}
+
+pub fn remove_storage_snapshot(env: &Env, contract_address: &Address, storage_key: &Val) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::StorageSnapshot(contract_address.clone(), storage_key.clone()));
 }
