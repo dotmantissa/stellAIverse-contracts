@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map,
-    String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
+    Symbol, Vec,
 };
 use stellai_lib::{
     admin, audit, validation, rbac, ComplianceFinding, ComplianceReport, ComplianceStatus,
@@ -32,9 +32,99 @@ pub enum Error {
     KycInvalidTransition = 16,
     KycTerminalState = 17,
     KycRequestExpired = 18,
+    KycOperatorRequired = 19,
+    KycSelfAssignment = 20,
+    KycNotVerified = 21,
+    KycOverrideNotScheduled = 22,
+    KycOverrideNotReady = 23,
+    KycOverrideAlreadyScheduled = 24,
 }
 
-// ── KYC State Machine (issues #147 & #148) ──────────────────────────────────
+// ── Compliance Types ────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ComplianceReport {
+    pub report_id: u64,
+    pub entity_did: String,
+    pub compliance_type: ComplianceType,
+    pub status: ComplianceStatus,
+    pub score: u32,
+    pub risk_level: RiskLevel,
+    pub findings: Vec<ComplianceFinding>,
+    pub issued_by: Address,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+#[repr(u32)]
+pub enum ComplianceType {
+    KYC = 0,
+    AML = 1,
+    Sanctions = 2,
+    TaxCompliance = 3,
+    DataPrivacy = 4,
+    FinancialRegulation = 5,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+#[repr(u32)]
+pub enum ComplianceStatus {
+    Compliant = 0,
+    NonCompliant = 1,
+    Pending = 2,
+    UnderReview = 3,
+    Exempt = 4,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[contracttype]
+#[repr(u32)]
+pub enum RiskLevel {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    Critical = 3,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ComplianceFinding {
+    pub category: String,
+    pub severity: String,
+    pub description: String,
+    pub recommendation: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ReputationScore {
+    pub entity_did: String,
+    pub overall_score: u32,
+    pub category_scores: Map<String, u32>,
+    pub review_count: u32,
+    pub last_updated: u64,
+    pub calculation_method: String,
+}
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct ReputationReview {
+    pub review_id: u64,
+    pub reviewer_did: String,
+    pub subject_did: String,
+    pub rating: u32,
+    pub category: String,
+    pub comment: Option<String>,
+    pub evidence: Vec<String>,
+    pub created_at: u64,
+    pub verified: bool,
+}
+
+// ── KYC State Machine (issues #174, #175, #176, #177) ──────────────────────
 
 /// KYC lifecycle states.
 /// Valid transitions: Pending → InReview → Verified
@@ -53,6 +143,7 @@ pub enum KycStatus {
 #[derive(Clone, Debug)]
 #[contracttype]
 pub struct KycRecord {
+    pub subject: Address,
     pub subject_did: String,
     pub status: KycStatus,
     pub updated_by: Address,
@@ -66,6 +157,18 @@ pub struct KycRecord {
 }
 
 const KYC_RECORDS: Symbol = symbol_short!("kyc_rec");
+const KYC_OPERATORS: Symbol = symbol_short!("kyc_ops");
+const KYC_OVERRIDES: Symbol = symbol_short!("kyc_ovr");
+const ADMIN_KEY: Symbol = symbol_short!("admin");
+
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct KycOverrideRequest {
+    pub subject: Address,
+    pub requested_by: Address,
+    pub execute_after: u64,
+    pub created_at: u64,
+}
 
 // Contract events
 #[contracttype]
@@ -148,13 +251,17 @@ const REVIEW_COUNTER: Symbol = symbol_short!("rev_cnt");
 const ASSESSMENT_COUNTER: Symbol = symbol_short!("ass_cnt");
 
 // Constants
+#[allow(dead_code)]
 const MAX_REVIEWS_PER_ENTITY: u32 = 1000;
 const MAX_FINDINGS_PER_REPORT: u32 = 50;
+#[allow(dead_code)]
 const REPUTATION_DECAY_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days
 const MIN_RATING: u32 = 1;
 const MAX_RATING: u32 = 5;
 /// Default expiry period for pending KYC requests (90 days)
 const KYC_PENDING_EXPIRY_SECS: u64 = 90 * 24 * 60 * 60;
+/// Governance timelock for terminal-state overrides (24 hours)
+const KYC_OVERRIDE_DELAY_SECS: u64 = 24 * 60 * 60;
 
 #[contract]
 pub struct ComplianceIntegrationContract;
@@ -176,8 +283,10 @@ impl ComplianceIntegrationContract {
         // Validate inputs
         Self::validate_compliance_inputs(env.clone(), &entity_did, &findings)?;
 
-        // Check authorization
-        admin::verify_admin(&env, &issued_by).map_err(|_| Error::Unauthorized)?;
+        // Sensitive entry points are gated behind verified KYC and admin authorization.
+        issued_by.require_auth();
+        Self::require_verified_kyc(&env, &issued_by)?;
+        Self::verify_admin(&env, &issued_by)?;
 
         // Generate report ID
         let report_id = Self::increment_counter(env.clone(), &REPORT_COUNTER);
@@ -236,8 +345,9 @@ impl ComplianceIntegrationContract {
         // Get existing report
         let mut report = Self::get_compliance_report(env.clone(), report_id)?;
 
-        // Check authorization
-        admin::verify_admin(&env, &updated_by).map_err(|_| Error::Unauthorized)?;
+        updated_by.require_auth();
+        Self::require_verified_kyc(&env, &updated_by)?;
+        Self::verify_admin(&env, &updated_by)?;
 
         // Update report
         report.status = status;
@@ -280,10 +390,11 @@ impl ComplianceIntegrationContract {
         compliance_type: ComplianceType,
         verifier: Address,
     ) -> Result<bool, Error> {
-        // Check authorization
-        admin::verify_admin(&env, &verifier).map_err(|_| Error::Unauthorized)?;
+        verifier.require_auth();
+        Self::require_verified_kyc(&env, &verifier)?;
+        Self::verify_admin(&env, &verifier)?;
 
-        let mut all_valid = true;
+        let all_valid = true;
         let now = env.ledger().timestamp();
 
         for credential_id in credential_ids {
@@ -316,6 +427,7 @@ impl ComplianceIntegrationContract {
     /// Add a reputation review
     pub fn add_reputation_review(
         env: Env,
+        reviewer: Address,
         reviewer_did: String,
         subject_did: String,
         rating: u32,
@@ -325,6 +437,8 @@ impl ComplianceIntegrationContract {
     ) -> Result<u64, Error> {
         // Validate inputs
         Self::validate_review_inputs(&rating, &category, &evidence)?;
+        reviewer.require_auth();
+        Self::require_verified_kyc(&env, &reviewer)?;
 
         // Generate review ID
         let review_id = Self::increment_counter(env.clone(), &REVIEW_COUNTER);
@@ -412,10 +526,10 @@ impl ComplianceIntegrationContract {
     /// Get reviews for an entity
     pub fn get_entity_reviews(
         env: Env,
-        entity_did: String,
-        limit: u32,
+        _entity_did: String,
+        _limit: u32,
     ) -> Result<Vec<ReputationReview>, Error> {
-        let mut reviews = Vec::new(&env);
+        let reviews = Vec::new(&env);
 
         // In a real implementation, we'd have an index by entity_did
         // For now, return empty vector
@@ -428,14 +542,13 @@ impl ComplianceIntegrationContract {
         entity_did: String,
         required_types: Vec<ComplianceType>,
         minimum_score: u32,
-        maximum_risk_level: RiskLevel,
+        _maximum_risk_level: RiskLevel,
     ) -> Result<bool, Error> {
         let mut meets_requirements = true;
-        let now = env.ledger().timestamp();
 
-        for compliance_type in required_types {
+        for _compliance_type in required_types {
             // Check if entity has a valid compliance report for this type
-            let mut has_valid_report = false;
+            let has_valid_report = false;
 
             // In a real implementation, we'd query reports by entity_did and type
             // For now, we'll simulate the check
@@ -464,8 +577,9 @@ impl ComplianceIntegrationContract {
         mitigation: Option<String>,
         assessed_by: Address,
     ) -> Result<u64, Error> {
-        // Check authorization
-        admin::verify_admin(&env, &assessed_by).map_err(|_| Error::Unauthorized)?;
+        assessed_by.require_auth();
+        Self::require_verified_kyc(&env, &assessed_by)?;
+        Self::verify_admin(&env, &assessed_by)?;
 
         // Generate assessment ID
         let assessment_id = Self::increment_counter(env.clone(), &ASSESSMENT_COUNTER);
@@ -505,7 +619,7 @@ impl ComplianceIntegrationContract {
 
     // Helper functions
     fn validate_compliance_inputs(
-        env: Env,
+        _env: Env,
         entity_did: &String,
         findings: &Vec<ComplianceFinding>,
     ) -> Result<(), Error> {
@@ -525,7 +639,7 @@ impl ComplianceIntegrationContract {
     fn validate_review_inputs(
         rating: &u32,
         category: &String,
-        evidence: &Vec<String>,
+        _evidence: &Vec<String>,
     ) -> Result<(), Error> {
         // Validate rating range
         if *rating < MIN_RATING || *rating > MAX_RATING {
@@ -544,7 +658,7 @@ impl ComplianceIntegrationContract {
         env: Env,
         entity_did: String,
         compliance_score: u32,
-        risk_level: RiskLevel,
+        _risk_level: RiskLevel,
     ) {
         let mut reputation = Self::get_reputation_score(env.clone(), entity_did.clone()).unwrap();
 
@@ -624,6 +738,18 @@ impl ComplianceIntegrationContract {
         );
     }
 
+    fn verify_admin(env: &Env, caller: &Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(Error::Unauthorized)?;
+        if &admin != caller {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
     fn increment_counter(env: Env, counter_key: &Symbol) -> u64 {
         let count: u64 = env.storage().instance().get(counter_key).unwrap_or(0);
         let new_count = count + 1;
@@ -640,8 +766,10 @@ impl ComplianceIntegrationContract {
         if env.storage().instance().has(&key) {
             return Err(Error::DuplicateReport);
         }
+
         let now = env.ledger().timestamp();
         let record = KycRecord {
+            subject: subject.clone(),
             subject_did: subject_did.clone(),
             status: KycStatus::Pending,
             updated_by: operator.clone(),
@@ -650,10 +778,10 @@ impl ComplianceIntegrationContract {
             created_at: now,
             expires_at: Some(now + KYC_PENDING_EXPIRY_SECS),
         };
-        env.storage().instance().set(&key, &record);
+        Self::put_kyc_record(&env, &subject, &record);
         env.events().publish(
             (Symbol::new(&env, "kyc"), Symbol::new(&env, "init")),
-            (subject_did, KycStatus::Pending),
+            (subject, subject_did, operator, KycStatus::Pending),
         );
         Ok(())
     }
@@ -665,7 +793,7 @@ impl ComplianceIntegrationContract {
     pub fn kyc_transition(
         env: Env,
         operator: Address,
-        subject_did: String,
+        subject: Address,
         new_status: KycStatus,
     ) -> Result<(), Error> {
         rbac::require_kyc_operator_role(&env, &operator).map_err(|_| Error::Unauthorized)?;
@@ -676,50 +804,48 @@ impl ComplianceIntegrationContract {
             .get(&key)
             .ok_or(Error::KycSubjectNotFound)?;
 
-        // Check if pending request has expired (issue: KYC expiry)
+        let mut record = Self::get_kyc_record(&env, &subject)?;
         if record.status == KycStatus::Pending {
             if let Some(expires_at) = record.expires_at {
                 let now = env.ledger().timestamp();
                 if now >= expires_at {
-                    // Emit expiry event before rejecting
                     env.events().publish(
                         (Symbol::new(&env, "kyc"), Symbol::new(&env, "expired")),
-                        (subject_did.clone(), expires_at),
+                        (subject.clone(), record.subject_did.clone(), expires_at),
                     );
                     return Err(Error::KycRequestExpired);
                 }
             }
         }
 
-        // Reject mutations of terminal states (issue #147).
-        if record.status == KycStatus::Verified || record.status == KycStatus::Rejected {
+        if Self::is_terminal_kyc_status(record.status) {
             return Err(Error::KycTerminalState);
         }
-
-        // Enforce strict ordering (issue #148).
-        let allowed = matches!(
-            (record.status, new_status),
-            (KycStatus::Pending, KycStatus::InReview)
-                | (KycStatus::InReview, KycStatus::Verified)
-                | (KycStatus::InReview, KycStatus::Rejected)
-        );
-        if !allowed {
+        if !Self::is_valid_kyc_transition(record.status, new_status) {
             return Err(Error::KycInvalidTransition);
         }
 
+        let previous_status = record.status;
         let now = env.ledger().timestamp();
-        let is_terminal =
-            new_status == KycStatus::Verified || new_status == KycStatus::Rejected;
         record.status = new_status;
         record.updated_by = operator.clone();
         record.updated_at = now;
-        if is_terminal {
-            record.finalized_at = Some(now);
-        }
-        env.storage().instance().set(&key, &record);
+        record.expires_at = None;
+        record.finalized_at = if Self::is_terminal_kyc_status(new_status) {
+            Some(now)
+        } else {
+            None
+        };
+        Self::put_kyc_record(&env, &subject, &record);
         env.events().publish(
             (Symbol::new(&env, "kyc"), Symbol::new(&env, "transition")),
-            (subject_did, new_status),
+            (
+                subject,
+                record.subject_did,
+                operator,
+                previous_status,
+                new_status,
+            ),
         );
         Ok(())
     }
@@ -729,35 +855,83 @@ impl ComplianceIntegrationContract {
     pub fn kyc_governance_override(
         env: Env,
         governance: Address,
-        subject_did: String,
+        subject: Address,
+    ) -> Result<u64, Error> {
+        governance.require_auth();
+        Self::verify_admin(&env, &governance)?;
+        let record = Self::get_kyc_record(&env, &subject)?;
+        if !Self::is_terminal_kyc_status(record.status) {
+            return Err(Error::KycInvalidTransition);
+        }
+        if env
+            .storage()
+            .instance()
+            .has(&(KYC_OVERRIDES, subject.clone()))
+        {
+            return Err(Error::KycOverrideAlreadyScheduled);
+        }
+
+        let now = env.ledger().timestamp();
+        let execute_after = now + KYC_OVERRIDE_DELAY_SECS;
+        let request = KycOverrideRequest {
+            subject: subject.clone(),
+            requested_by: governance.clone(),
+            execute_after,
+            created_at: now,
+        };
+        env.storage()
+            .instance()
+            .set(&(KYC_OVERRIDES, subject.clone()), &request);
+        env.events().publish(
+            (Symbol::new(&env, "kyc"), Symbol::new(&env, "schedule")),
+            (subject, governance, execute_after),
+        );
+        Ok(execute_after)
+    }
+
+    /// Governance executes a previously scheduled override and resets the subject to Pending.
+    pub fn kyc_execute_override(
+        env: Env,
+        governance: Address,
+        subject: Address,
     ) -> Result<(), Error> {
         rbac::require_governance_role(&env, &governance).map_err(|_| Error::Unauthorized)?;
         let key = (KYC_RECORDS, subject_did.clone());
         let mut record: KycRecord = env
             .storage()
             .instance()
-            .get(&key)
-            .ok_or(Error::KycSubjectNotFound)?;
+            .get(&(KYC_OVERRIDES, subject.clone()))
+            .ok_or(Error::KycOverrideNotScheduled)?;
         let now = env.ledger().timestamp();
+        if now < request.execute_after {
+            return Err(Error::KycOverrideNotReady);
+        }
+
+        let mut record = Self::get_kyc_record(&env, &subject)?;
+        if !Self::is_terminal_kyc_status(record.status) {
+            return Err(Error::KycInvalidTransition);
+        }
+
         record.status = KycStatus::Pending;
         record.updated_by = governance.clone();
         record.updated_at = now;
+        record.created_at = now;
         record.finalized_at = None;
-        env.storage().instance().set(&key, &record);
+        record.expires_at = Some(now + KYC_PENDING_EXPIRY_SECS);
+        Self::put_kyc_record(&env, &subject, &record);
+        env.storage()
+            .instance()
+            .remove(&(KYC_OVERRIDES, subject.clone()));
         env.events().publish(
             (Symbol::new(&env, "kyc"), Symbol::new(&env, "override")),
-            (subject_did, KycStatus::Pending),
+            (subject, record.subject_did, governance, KycStatus::Pending),
         );
         Ok(())
     }
 
     /// Read the current KYC record for a subject.
-    pub fn kyc_get(env: Env, subject_did: String) -> Result<KycRecord, Error> {
-        let key = (KYC_RECORDS, subject_did);
-        env.storage()
-            .instance()
-            .get(&key)
-            .ok_or(Error::KycSubjectNotFound)
+    pub fn kyc_get(env: Env, subject: Address) -> Result<KycRecord, Error> {
+        Self::get_kyc_record(&env, &subject)
     }
 }
 
@@ -766,267 +940,594 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         symbol_short,
-        testutils::Address as _,
-        Address, Env, String,
+        testutils::{Address as _, Ledger as _},
+        Address, Env, String, Vec,
     };
 
-    fn setup(env: &Env) -> (Address, Address) {
-        let contract_id = env.register_contract(None, ComplianceIntegrationContract);
+    fn setup(env: &Env) -> (Address, Address, Address, Address) {
+        let contract_id = env.register(ComplianceIntegrationContract, ());
         let admin = Address::generate(env);
+        let operator_one = Address::generate(env);
+        let operator_two = Address::generate(env);
         env.as_contract(&contract_id, || {
             env.storage()
                 .instance()
                 .set(&symbol_short!("admin"), &admin);
         });
-        (contract_id, admin)
+        env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::kyc_set_operator(
+                env.clone(),
+                admin.clone(),
+                operator_one.clone(),
+                true,
+            )
+            .unwrap()
+        });
+        env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::kyc_set_operator(
+                env.clone(),
+                admin.clone(),
+                operator_two.clone(),
+                true,
+            )
+            .unwrap()
+        });
+        (contract_id, admin, operator_one, operator_two)
+    }
+
+    fn init_subject(
+        env: &Env,
+        contract_id: &Address,
+        operator: &Address,
+        subject: &Address,
+        did: &str,
+    ) {
+        env.as_contract(contract_id, || {
+            ComplianceIntegrationContract::kyc_init(
+                env.clone(),
+                operator.clone(),
+                subject.clone(),
+                String::from_str(env, did),
+            )
+            .unwrap();
+        });
+    }
+
+    fn transition_subject(
+        env: &Env,
+        contract_id: &Address,
+        operator: &Address,
+        subject: &Address,
+        status: KycStatus,
+    ) -> Result<(), Error> {
+        env.as_contract(contract_id, || {
+            ComplianceIntegrationContract::kyc_transition(
+                env.clone(),
+                operator.clone(),
+                subject.clone(),
+                status,
+            )
+        })
+    }
+
+    fn verify_subject(
+        env: &Env,
+        contract_id: &Address,
+        operator: &Address,
+        subject: &Address,
+        did: &str,
+    ) {
+        init_subject(env, contract_id, operator, subject, did);
+        transition_subject(env, contract_id, operator, subject, KycStatus::InReview).unwrap();
+        transition_subject(env, contract_id, operator, subject, KycStatus::Verified).unwrap();
+    }
+
+    fn sample_findings(env: &Env) -> Vec<ComplianceFinding> {
+        let mut findings = Vec::new(env);
+        findings.push_back(ComplianceFinding {
+            category: String::from_str(env, "kyc"),
+            severity: String::from_str(env, "medium"),
+            description: String::from_str(env, "manual review complete"),
+            recommendation: Some(String::from_str(env, "approve")),
+        });
+        findings
+    }
+
+    fn sample_string_vec(env: &Env, value: &str) -> Vec<String> {
+        let mut items = Vec::new(env);
+        items.push_back(String::from_str(env, value));
+        items
     }
 
     #[test]
     fn test_kyc_valid_transitions() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, admin) = setup(&env);
-        let subject = String::from_str(&env, "did:stellar:subject1");
+        let (contract_id, _admin, operator_one, _operator_two) = setup(&env);
+        let subject = Address::generate(&env);
 
-        env.as_contract(&contract_id, || {
-            ComplianceIntegrationContract::kyc_init(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-            )
-            .unwrap();
-
-            let rec = ComplianceIntegrationContract::kyc_get(env.clone(), subject.clone()).unwrap();
-            assert_eq!(rec.status, KycStatus::Pending);
-
-            ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-                KycStatus::InReview,
-            )
-            .unwrap();
-
-            ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-                KycStatus::Verified,
-            )
-            .unwrap();
-
-            let rec = ComplianceIntegrationContract::kyc_get(env.clone(), subject.clone()).unwrap();
-            assert_eq!(rec.status, KycStatus::Verified);
-            assert!(rec.finalized_at.is_some());
+        init_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            "did:stellar:subject1",
+        );
+        let rec = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::kyc_get(env.clone(), subject.clone()).unwrap()
         });
+        assert_eq!(rec.status, KycStatus::Pending);
+        assert_eq!(rec.subject, subject);
+
+        transition_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            KycStatus::InReview,
+        )
+        .unwrap();
+        transition_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            KycStatus::Verified,
+        )
+        .unwrap();
+
+        let rec = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::kyc_get(env.clone(), subject.clone()).unwrap()
+        });
+        assert_eq!(rec.status, KycStatus::Verified);
+        assert!(rec.finalized_at.is_some());
+        assert!(env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::kyc_is_verified(env.clone(), subject.clone())
+        }));
     }
 
     #[test]
-    fn test_kyc_skip_transition_rejected() {
+    fn test_invalid_transition_sequences_rejected() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, admin) = setup(&env);
-        let subject = String::from_str(&env, "did:stellar:subject2");
+        let (contract_id, _admin, operator_one, _operator_two) = setup(&env);
+        let subject = Address::generate(&env);
 
-        env.as_contract(&contract_id, || {
-            ComplianceIntegrationContract::kyc_init(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-            )
-            .unwrap();
+        init_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            "did:stellar:subject2",
+        );
 
-            // Skipping InReview → should fail (issue #148)
-            let err = ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-                KycStatus::Verified,
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &subject,
+                KycStatus::Pending
             )
-            .unwrap_err();
-            assert_eq!(err, Error::KycInvalidTransition);
-        });
+            .unwrap_err(),
+            Error::KycInvalidTransition
+        );
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &subject,
+                KycStatus::Verified
+            )
+            .unwrap_err(),
+            Error::KycInvalidTransition
+        );
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &subject,
+                KycStatus::Rejected
+            )
+            .unwrap_err(),
+            Error::KycInvalidTransition
+        );
+
+        transition_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            KycStatus::InReview,
+        )
+        .unwrap();
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &subject,
+                KycStatus::Pending
+            )
+            .unwrap_err(),
+            Error::KycInvalidTransition
+        );
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &subject,
+                KycStatus::InReview
+            )
+            .unwrap_err(),
+            Error::KycInvalidTransition
+        );
     }
 
     #[test]
-    fn test_kyc_terminal_state_immutable() {
+    fn test_terminal_states_are_immutable_without_override() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, admin) = setup(&env);
-        let subject = String::from_str(&env, "did:stellar:subject3");
-
-        env.as_contract(&contract_id, || {
-            ComplianceIntegrationContract::kyc_init(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-            )
-            .unwrap();
-            ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-                KycStatus::InReview,
-            )
-            .unwrap();
-            ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
+        let (contract_id, _admin, operator_one, _operator_two) = setup(&env);
+        let verified_subject = Address::generate(&env);
+        verify_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &verified_subject,
+            "did:stellar:subject3",
+        );
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &verified_subject,
                 KycStatus::Rejected,
             )
-            .unwrap();
-
-            // Attempt to mutate terminal state → must fail (issue #147)
-            let err = ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
+            .unwrap_err(),
+            Error::KycTerminalState
+        );
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &verified_subject,
                 KycStatus::Pending,
             )
-            .unwrap_err();
-            assert_eq!(err, Error::KycTerminalState);
-        });
-    }
+            .unwrap_err(),
+            Error::KycTerminalState
+        );
 
-    #[test]
-    fn test_kyc_governance_override() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, admin) = setup(&env);
-        let subject = String::from_str(&env, "did:stellar:subject4");
-
-        env.as_contract(&contract_id, || {
-            ComplianceIntegrationContract::kyc_init(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-            )
-            .unwrap();
-            ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-                KycStatus::InReview,
-            )
-            .unwrap();
-            ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
+        let rejected_subject = Address::generate(&env);
+        init_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &rejected_subject,
+            "did:stellar:subject4",
+        );
+        transition_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &rejected_subject,
+            KycStatus::InReview,
+        )
+        .unwrap();
+        transition_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &rejected_subject,
+            KycStatus::Rejected,
+        )
+        .unwrap();
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &rejected_subject,
                 KycStatus::Verified,
             )
-            .unwrap();
-
-            // Governance override resets terminal state
-            ComplianceIntegrationContract::kyc_governance_override(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-            )
-            .unwrap();
-
-            let rec = ComplianceIntegrationContract::kyc_get(env.clone(), subject.clone()).unwrap();
-            assert_eq!(rec.status, KycStatus::Pending);
-            assert!(rec.finalized_at.is_none());
-        });
+            .unwrap_err(),
+            Error::KycTerminalState
+        );
     }
 
     #[test]
-    fn test_kyc_expired_request_cannot_transition() {
+    fn test_only_kyc_operators_can_assign_status() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, admin) = setup(&env);
-        let subject = String::from_str(&env, "did:stellar:subject5");
+        let (contract_id, _admin, operator_one, _operator_two) = setup(&env);
+        let outsider = Address::generate(&env);
+        let subject = Address::generate(&env);
 
-        env.as_contract(&contract_id, || {
+        let init_err = env.as_contract(&contract_id, || {
             ComplianceIntegrationContract::kyc_init(
                 env.clone(),
-                admin.clone(),
+                outsider.clone(),
                 subject.clone(),
+                String::from_str(&env, "did:stellar:subject5"),
             )
-            .unwrap();
-
-            // Advance time past expiry (90 days + 1 second)
-            env.ledger().with_mut_ledger_info(|li| {
-                li.timestamp += KYC_PENDING_EXPIRY_SECS + 1;
-            });
-
-            // Should fail with KycRequestExpired
-            let err = ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
-                KycStatus::InReview,
-            )
-            .unwrap_err();
-            assert_eq!(err, Error::KycRequestExpired);
+            .unwrap_err()
         });
+        assert_eq!(init_err, Error::KycOperatorRequired);
+
+        init_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            "did:stellar:subject5",
+        );
+        assert_eq!(
+            transition_subject(&env, &contract_id, &outsider, &subject, KycStatus::InReview)
+                .unwrap_err(),
+            Error::KycOperatorRequired
+        );
     }
 
     #[test]
-    fn test_kyc_boundary_exact_expiry_time() {
+    fn test_operator_cannot_self_assign_kyc_status() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, admin) = setup(&env);
-        let subject = String::from_str(&env, "did:stellar:subject6");
+        let (contract_id, _admin, operator_one, operator_two) = setup(&env);
 
-        env.as_contract(&contract_id, || {
+        let init_err = env.as_contract(&contract_id, || {
             ComplianceIntegrationContract::kyc_init(
                 env.clone(),
-                admin.clone(),
-                subject.clone(),
+                operator_one.clone(),
+                operator_one.clone(),
+                String::from_str(&env, "did:stellar:self"),
             )
-            .unwrap();
+            .unwrap_err()
+        });
+        assert_eq!(init_err, Error::KycSelfAssignment);
 
-            // Advance time to exactly expiry moment
-            env.ledger().with_mut_ledger_info(|li| {
-                li.timestamp += KYC_PENDING_EXPIRY_SECS;
-            });
-
-            // At exact expiry time, should fail (now >= expires_at)
-            let err = ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
+        init_subject(
+            &env,
+            &contract_id,
+            &operator_two,
+            &operator_one,
+            "did:stellar:operator-one",
+        );
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &operator_one,
                 KycStatus::InReview,
             )
-            .unwrap_err();
-            assert_eq!(err, Error::KycRequestExpired);
-        });
+            .unwrap_err(),
+            Error::KycSelfAssignment
+        );
     }
 
     #[test]
-    fn test_kyc_valid_before_expiry() {
+    fn test_governance_override_requires_timelock_delay() {
         let env = Env::default();
         env.mock_all_auths();
-        let (contract_id, admin) = setup(&env);
-        let subject = String::from_str(&env, "did:stellar:subject7");
+        let (contract_id, admin, operator_one, _operator_two) = setup(&env);
+        let subject = Address::generate(&env);
+        verify_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            "did:stellar:subject6",
+        );
 
+        let execute_after = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::kyc_schedule_override(
+                env.clone(),
+                admin.clone(),
+                subject.clone(),
+            )
+            .unwrap()
+        });
+        let early_err = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::kyc_execute_override(
+                env.clone(),
+                admin.clone(),
+                subject.clone(),
+            )
+            .unwrap_err()
+        });
+        assert_eq!(early_err, Error::KycOverrideNotReady);
+
+        env.ledger().set_timestamp(execute_after);
         env.as_contract(&contract_id, || {
-            ComplianceIntegrationContract::kyc_init(
+            ComplianceIntegrationContract::kyc_execute_override(
                 env.clone(),
                 admin.clone(),
                 subject.clone(),
             )
             .unwrap();
+        });
 
-            // Advance time to just before expiry (90 days - 1 second)
-            env.ledger().with_mut_ledger_info(|li| {
-                li.timestamp += KYC_PENDING_EXPIRY_SECS - 1;
-            });
+        let rec = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::kyc_get(env.clone(), subject.clone()).unwrap()
+        });
+        assert_eq!(rec.status, KycStatus::Pending);
+        assert!(rec.finalized_at.is_none());
+        assert_eq!(rec.created_at, execute_after);
+        assert_eq!(
+            rec.expires_at,
+            Some(execute_after + KYC_PENDING_EXPIRY_SECS)
+        );
+    }
 
-            // Should succeed - still within valid period
-            ComplianceIntegrationContract::kyc_transition(
-                env.clone(),
-                admin.clone(),
-                subject.clone(),
+    #[test]
+    fn test_kyc_expiry_boundary_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, _admin, operator_one, _operator_two) = setup(&env);
+        let subject = Address::generate(&env);
+
+        init_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            "did:stellar:subject7",
+        );
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + KYC_PENDING_EXPIRY_SECS - 1);
+        transition_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &subject,
+            KycStatus::InReview,
+        )
+        .unwrap();
+
+        let second_subject = Address::generate(&env);
+        init_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &second_subject,
+            "did:stellar:subject8",
+        );
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + KYC_PENDING_EXPIRY_SECS);
+        assert_eq!(
+            transition_subject(
+                &env,
+                &contract_id,
+                &operator_one,
+                &second_subject,
                 KycStatus::InReview,
             )
-            .unwrap();
+            .unwrap_err(),
+            Error::KycRequestExpired
+        );
+    }
 
-            let rec = ComplianceIntegrationContract::kyc_get(env.clone(), subject.clone()).unwrap();
-            assert_eq!(rec.status, KycStatus::InReview);
+    #[test]
+    fn test_sensitive_admin_entry_points_require_verified_kyc() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, admin, operator_one, _operator_two) = setup(&env);
+        let findings = sample_findings(&env);
+
+        let report_err = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::generate_compliance_report(
+                env.clone(),
+                String::from_str(&env, "did:stellar:entity1"),
+                ComplianceType::KYC,
+                ComplianceStatus::Compliant,
+                95,
+                RiskLevel::Low,
+                findings.clone(),
+                admin.clone(),
+                30,
+            )
+            .unwrap_err()
         });
+        assert_eq!(report_err, Error::KycNotVerified);
+
+        verify_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &admin,
+            "did:stellar:admin",
+        );
+
+        let report_id = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::generate_compliance_report(
+                env.clone(),
+                String::from_str(&env, "did:stellar:entity1"),
+                ComplianceType::KYC,
+                ComplianceStatus::Compliant,
+                95,
+                RiskLevel::Low,
+                findings.clone(),
+                admin.clone(),
+                30,
+            )
+            .unwrap()
+        });
+        assert_eq!(report_id, 1);
+
+        let mut credential_ids = Vec::new(&env);
+        credential_ids.push_back(7u64);
+        assert!(env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::verify_creds_compliance(
+                env.clone(),
+                String::from_str(&env, "did:stellar:entity1"),
+                credential_ids.clone(),
+                ComplianceType::AML,
+                admin.clone(),
+            )
+            .unwrap()
+        }));
+
+        let assessment_id = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::create_risk_assessment(
+                env.clone(),
+                String::from_str(&env, "did:stellar:entity1"),
+                RiskLevel::Medium,
+                sample_string_vec(&env, "jurisdiction"),
+                Some(String::from_str(&env, "enhanced monitoring")),
+                admin.clone(),
+            )
+            .unwrap()
+        });
+        assert_eq!(assessment_id, 1);
+    }
+
+    #[test]
+    fn test_reputation_reviews_require_verified_kyc() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, _admin, operator_one, _operator_two) = setup(&env);
+        let reviewer = Address::generate(&env);
+
+        let review_err = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::add_reputation_review(
+                env.clone(),
+                reviewer.clone(),
+                String::from_str(&env, "did:stellar:reviewer"),
+                String::from_str(&env, "did:stellar:subject9"),
+                5,
+                String::from_str(&env, "delivery"),
+                Some(String::from_str(&env, "complete and timely")),
+                sample_string_vec(&env, "cred-1"),
+            )
+            .unwrap_err()
+        });
+        assert_eq!(review_err, Error::KycNotVerified);
+
+        verify_subject(
+            &env,
+            &contract_id,
+            &operator_one,
+            &reviewer,
+            "did:stellar:reviewer",
+        );
+        let review_id = env.as_contract(&contract_id, || {
+            ComplianceIntegrationContract::add_reputation_review(
+                env.clone(),
+                reviewer.clone(),
+                String::from_str(&env, "did:stellar:reviewer"),
+                String::from_str(&env, "did:stellar:subject9"),
+                5,
+                String::from_str(&env, "delivery"),
+                Some(String::from_str(&env, "complete and timely")),
+                sample_string_vec(&env, "cred-1"),
+            )
+            .unwrap()
+        });
+        assert_eq!(review_id, 1);
     }
 }
