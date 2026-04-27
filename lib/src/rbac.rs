@@ -6,7 +6,7 @@
 /// 
 /// Issue #179: Prevent Role Escalation via Indirect Function Calls
 /// Issue #178: Implement Role Separation Between Governance and KYC Operators
-use soroban_sdk::{Address, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
 use crate::{errors::ContractError, ADMIN_KEY, APPROVED_MINTERS_KEY};
 
@@ -179,7 +179,6 @@ pub enum RoleType {
 /// Storage keys for role separation
 const GOVERNANCE_ROLE_KEY: &str = "governance_role";
 const KYC_OPERATOR_ROLE_KEY: &str = "kyc_operator_role";
-const ROLE_ASSIGNMENTS_KEY: &str = "role_assignments";
 
 /// Require governance role - mutually exclusive with KYC operator
 pub fn require_governance_role(env: &Env, caller: &Address) -> Result<(), ContractError> {
@@ -191,9 +190,9 @@ pub fn require_governance_role(env: &Env, caller: &Address) -> Result<(), Contra
         .unwrap_or_else(|| Vec::new(env));
 
     for role in governance_roles.iter() {
-        if &role == caller {
+        if role == *caller {
             // Ensure caller does not also have KYC operator role
-            if has_kyc_operator_role(env, caller)? {
+            if has_kyc_operator_role(env, &role)? {
                 return Err(ContractError::RoleConflict);
             }
             return Ok(());
@@ -213,9 +212,9 @@ pub fn require_kyc_operator_role(env: &Env, caller: &Address) -> Result<(), Cont
         .unwrap_or_else(|| Vec::new(env));
 
     for op in kyc_operators.iter() {
-        if &op == caller {
+        if op == *caller {
             // Ensure caller does not also have governance role
-            if has_governance_role(env, caller)? {
+            if has_governance_role(env, &op)? {
                 return Err(ContractError::RoleConflict);
             }
             return Ok(());
@@ -233,7 +232,7 @@ pub fn has_governance_role(env: &Env, address: &Address) -> Result<bool, Contrac
         .get(&Symbol::new(env, GOVERNANCE_ROLE_KEY))
         .unwrap_or_else(|| Vec::new(env));
 
-    Ok(governance_roles.iter().any(|role| role == address))
+    Ok(governance_roles.iter().any(|role| role == *address))
 }
 
 /// Check if address has KYC operator role
@@ -244,7 +243,7 @@ pub fn has_kyc_operator_role(env: &Env, address: &Address) -> Result<bool, Contr
         .get(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY))
         .unwrap_or_else(|| Vec::new(env));
 
-    Ok(kyc_operators.iter().any(|op| op == address))
+    Ok(kyc_operators.iter().any(|op| op == *address))
 }
 
 /// Assign governance role (admin only) - ensures mutual exclusion
@@ -266,7 +265,7 @@ pub fn assign_governance_role(
         .get(&Symbol::new(env, GOVERNANCE_ROLE_KEY))
         .unwrap_or_else(|| Vec::new(env));
 
-    if !governance_roles.iter().any(|role| role == new_governance) {
+    if !governance_roles.iter().any(|role| role == *new_governance) {
         governance_roles.push_back(new_governance.clone());
         env.storage()
             .instance()
@@ -295,7 +294,7 @@ pub fn assign_kyc_operator_role(
         .get(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY))
         .unwrap_or_else(|| Vec::new(env));
 
-    if !kyc_operators.iter().any(|op| op == new_operator) {
+    if !kyc_operators.iter().any(|op| op == *new_operator) {
         kyc_operators.push_back(new_operator.clone());
         env.storage()
             .instance()
@@ -313,16 +312,25 @@ fn remove_from_governance(env: &Env, address: &Address) -> Result<(), ContractEr
         .get(&Symbol::new(env, GOVERNANCE_ROLE_KEY))
         .unwrap_or_else(|| Vec::new(env));
 
-    governance_roles.retain(|role| role != address);
-    
-    if governance_roles.len() > 0 {
-        env.storage()
-            .instance()
-            .set(&Symbol::new(env, GOVERNANCE_ROLE_KEY), &governance_roles);
-    } else {
-        env.storage()
-            .instance()
-            .remove(&Symbol::new(env, GOVERNANCE_ROLE_KEY));
+    let mut index = None;
+    for (i, role) in governance_roles.iter().enumerate() {
+        if role == *address {
+            index = Some(i as u32);
+            break;
+        }
+    }
+
+    if let Some(i) = index {
+        governance_roles.remove(i);
+        if governance_roles.len() > 0 {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(env, GOVERNANCE_ROLE_KEY), &governance_roles);
+        } else {
+            env.storage()
+                .instance()
+                .remove(&Symbol::new(env, GOVERNANCE_ROLE_KEY));
+        }
     }
 
     Ok(())
@@ -336,16 +344,25 @@ fn remove_from_kyc_operators(env: &Env, address: &Address) -> Result<(), Contrac
         .get(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY))
         .unwrap_or_else(|| Vec::new(env));
 
-    kyc_operators.retain(|op| op != address);
-    
-    if kyc_operators.len() > 0 {
-        env.storage()
-            .instance()
-            .set(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY), &kyc_operators);
-    } else {
-        env.storage()
-            .instance()
-            .remove(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY));
+    let mut index = None;
+    for (i, op) in kyc_operators.iter().enumerate() {
+        if op == *address {
+            index = Some(i as u32);
+            break;
+        }
+    }
+
+    if let Some(i) = index {
+        kyc_operators.remove(i);
+        if kyc_operators.len() > 0 {
+            env.storage()
+                .instance()
+                .set(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY), &kyc_operators);
+        } else {
+            env.storage()
+                .instance()
+                .remove(&Symbol::new(env, KYC_OPERATOR_ROLE_KEY));
+        }
     }
 
     Ok(())
