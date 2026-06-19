@@ -51,14 +51,22 @@ impl ReferralRewards {
     ) -> Result<(), ContractError> {
         // Check for circular referral
         let referrer_referrer_key = (Symbol::new(&env, "ref"), referrer.clone());
-        if let Some(referrer_info) = env.storage().instance().get::<_, ReferralInfo>(&referrer_referrer_key) {
+        if let Some(referrer_info) = env
+            .storage()
+            .instance()
+            .get::<_, ReferralInfo>(&referrer_referrer_key)
+        {
             if referrer_info.referrer == referred {
                 return Err(ContractError::InvalidAgentId); // Circular: referred is referrer of referrer
             }
         }
 
         let referred_referrals_key = (Symbol::new(&env, "referrals"), referred.clone());
-        if let Some(referred_referrals) = env.storage().instance().get::<_, Vec<Address>>(&referred_referrals_key) {
+        if let Some(referred_referrals) = env
+            .storage()
+            .instance()
+            .get::<_, Vec<Address>>(&referred_referrals_key)
+        {
             for i in 0..referred_referrals.len() {
                 if let Some(r) = referred_referrals.get(i) {
                     if r == referrer {
@@ -88,7 +96,11 @@ impl ReferralRewards {
 
         // Add to referrer's referrals list
         let referrals_key = (Symbol::new(&env, "referrals"), referrer.clone());
-        let mut referrals: Vec<Address> = env.storage().instance().get(&referrals_key).unwrap_or(Vec::new(&env));
+        let mut referrals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&referrals_key)
+            .unwrap_or(Vec::new(&env));
         referrals.push_back(referred.clone());
         env.storage().instance().set(&referrals_key, &referrals);
 
@@ -220,20 +232,36 @@ impl ReferralRewards {
 
             // Indirect referrer
             let indirect_ref_key = (Symbol::new(&env, "ref"), direct_referrer.clone());
-            if let Some(indirect_info) = env.storage().instance().get::<_, ReferralInfo>(&indirect_ref_key) {
+            if let Some(indirect_info) = env
+                .storage()
+                .instance()
+                .get::<_, ReferralInfo>(&indirect_ref_key)
+            {
                 let indirect_referrer = indirect_info.referrer.clone();
                 let indirect_commission = commission * INDIRECT_MULTIPLIER / 100;
 
                 let indirect_reward_key = (Symbol::new(&env, "reward"), indirect_referrer.clone());
-                let mut indirect_balance: i128 = env.storage().instance().get(&indirect_reward_key).unwrap_or(0);
+                let mut indirect_balance: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&indirect_reward_key)
+                    .unwrap_or(0);
                 indirect_balance += indirect_commission;
-                env.storage().instance().set(&indirect_reward_key, &indirect_balance);
+                env.storage()
+                    .instance()
+                    .set(&indirect_reward_key, &indirect_balance);
 
                 // Update total for indirect
                 let indirect_total_key = (Symbol::new(&env, "total"), indirect_referrer.clone());
-                let mut indirect_total: i128 = env.storage().instance().get(&indirect_total_key).unwrap_or(0);
+                let mut indirect_total: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&indirect_total_key)
+                    .unwrap_or(0);
                 indirect_total += indirect_commission;
-                env.storage().instance().set(&indirect_total_key, &indirect_total);
+                env.storage()
+                    .instance()
+                    .set(&indirect_total_key, &indirect_total);
             }
         }
 
@@ -245,7 +273,11 @@ impl ReferralRewards {
         let direct = Self::get_referral_count(env.clone(), user.clone());
 
         let referrals_key = (Symbol::new(&env, "referrals"), user.clone());
-        let referrals: Vec<Address> = env.storage().instance().get(&referrals_key).unwrap_or(Vec::new(&env));
+        let referrals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&referrals_key)
+            .unwrap_or(Vec::new(&env));
 
         let mut indirect = 0u32;
         for i in 0..referrals.len() {
@@ -255,7 +287,11 @@ impl ReferralRewards {
         }
 
         let total_earnings_key = (Symbol::new(&env, "total"), user.clone());
-        let total_earnings: i128 = env.storage().instance().get(&total_earnings_key).unwrap_or(0);
+        let total_earnings: i128 = env
+            .storage()
+            .instance()
+            .get(&total_earnings_key)
+            .unwrap_or(0);
 
         let pending = Self::get_pending_rewards(env, user);
 
