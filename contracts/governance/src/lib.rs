@@ -1,8 +1,7 @@
 #![no_std]
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, token, Address, Env, String, Symbol, Val,
-    Vec,
+    contract, contracterror, contractimpl, token, Address, Env, String, Symbol, Val, Vec,
 };
 
 mod storage;

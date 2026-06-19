@@ -26,9 +26,7 @@ impl ThresholdAgentContract {
                 commitment: Bytes::new(&env),
                 created_at: env.ledger().timestamp(),
             };
-            env.storage()
-                .persistent()
-                .set(&(agent_id, i), &share);
+            env.storage().persistent().set(&(agent_id, i), &share);
         }
         env.events().publish(
             (Symbol::new(&env, "ThresholdAgentCreated"), agent_id),

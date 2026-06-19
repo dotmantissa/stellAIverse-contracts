@@ -273,31 +273,33 @@ impl AffiliateBonuses {
         // Calculate and record commission if threshold met
         let commission_amount = (volume * config.commission_rate_bps as i128) / 10000;
 
-        if commission_amount > 0 && referral_record.total_volume >= config.min_volume_for_commission
-            && user_total_commission + commission_amount <= config.max_commission_per_user {
-                pending_commissions += commission_amount;
-                user_total_commission += commission_amount;
+        if commission_amount > 0
+            && referral_record.total_volume >= config.min_volume_for_commission
+            && user_total_commission + commission_amount <= config.max_commission_per_user
+        {
+            pending_commissions += commission_amount;
+            user_total_commission += commission_amount;
 
-                env.storage()
-                    .instance()
-                    .set(&commission_key, &pending_commissions);
-                env.storage()
-                    .instance()
-                    .set(&user_commission_key, &user_total_commission);
+            env.storage()
+                .instance()
+                .set(&commission_key, &pending_commissions);
+            env.storage()
+                .instance()
+                .set(&user_commission_key, &user_total_commission);
 
-                // Update affiliate stats
-                affiliate_info.total_volume_generated += volume;
-                affiliate_info.total_commissions_earned += commission_amount;
-                affiliate_info.last_activity_at = now;
-                env.storage()
-                    .instance()
-                    .set(&affiliate_key, &affiliate_info);
+            // Update affiliate stats
+            affiliate_info.total_volume_generated += volume;
+            affiliate_info.total_commissions_earned += commission_amount;
+            affiliate_info.last_activity_at = now;
+            env.storage()
+                .instance()
+                .set(&affiliate_key, &affiliate_info);
 
-                env.events().publish(
-                    (Symbol::new(&env, "commission"), Symbol::new(&env, "earned")),
-                    (affiliate, user, commission_amount, volume),
-                );
-            }
+            env.events().publish(
+                (Symbol::new(&env, "commission"), Symbol::new(&env, "earned")),
+                (affiliate, user, commission_amount, volume),
+            );
+        }
 
         Ok(())
     }
