@@ -91,6 +91,11 @@ pub fn require_admin(env: &Env) {
     admin.require_auth();
 }
 
+pub fn is_admin(env: &Env, address: &Address) -> bool {
+    let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    &stored_admin == address
+}
+
 /* ---------------- PAYMENT TOKEN ---------------- */
 
 pub fn set_payment_token(env: &Env, token: Address) {

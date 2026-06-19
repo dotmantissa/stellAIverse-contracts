@@ -1,5 +1,7 @@
 use soroban_sdk::{Address, Env, String, Symbol, Vec};
 use stellai_lib::{AtomicTransaction, TransactionStatus, TransactionStep};
+// Export MarketplaceAtomicSupport for use by transaction coordinator
+pub use marketplace::atomic::MarketplaceAtomicSupport;
 
 /// Atomic Agent Sale Workflow
 ///
