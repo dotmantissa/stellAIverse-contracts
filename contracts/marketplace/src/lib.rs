@@ -1,5 +1,6 @@
 #![no_std]
 pub mod types;
+pub mod atomic;
 
 #[cfg(test)]
 mod prop_tests;
@@ -37,7 +38,23 @@ const BPS_DENOMINATOR: u128 = 10_000;
 
 #[contractimpl]
 impl MarketplaceContract {
-    
+    /// Initialize the marketplace contract
+    pub fn initialize(env: Env, admin: Address, payment_token: Address, platform_fee_bps: u32) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("Contract already initialized");
+        }
+        
+        admin.require_auth();
+        set_admin(&env, &admin);
+        set_payment_token(&env, payment_token);
+        set_platform_fee(&env, platform_fee_bps);
+        
+        // Initialize atomic transaction support
+        crate::atomic::MarketplaceAtomicSupport::initialize(&env);
+        
+        env.events().publish((symbol_short!("init"),), (admin, payment_token, platform_fee_bps));
+    }
+
     pub fn authorize_oracle(env: Env, admin: Address, oracle: Address) {
         admin.require_auth();
         env.storage().instance().set(&Symbol::new(&env, "oracle"), &oracle);
@@ -153,7 +170,7 @@ impl MarketplaceContract {
         let approval_config = get_approval_config(&env);
         let escrow_config = get_escrow_config(&env);
         let _platform_fee_bps = Self::get_platform_fee(env.clone());
-        let _royalty_info = Marketplace::get_royalty(env.clone(), listing.agent_id);
+        let _royalty_info = Self::get_royalty(env.clone(), listing.agent_id);
 
         // ─── VALIDATION PHASE ───
         if validation::validate_nonzero_id(listing_id).is_err() {
@@ -685,10 +702,10 @@ impl MarketplaceContract {
         // Execute the sale based on type
         if let Some(listing_id) = approval.listing_id {
             // Fixed-price sale
-            Marketplace::execute_approved_listing_sale(env, approval_id, listing_id);
+            Self::execute_approved_listing_sale(env, approval_id, listing_id);
         } else if let Some(auction_id) = approval.auction_id {
             // Auction sale
-            Marketplace::execute_approved_auction_sale(env, approval_id, auction_id);
+            Self::execute_approved_auction_sale(env, approval_id, auction_id);
         } else {
             panic!("Invalid approval: no listing or auction ID");
         }
@@ -706,7 +723,7 @@ impl MarketplaceContract {
 
         let approval = get_approval(&env, approval_id).expect("Approval not found");
         let platform_fee_bps = Self::get_platform_fee(env.clone());
-        let royalty_info = Marketplace::get_royalty(env.clone(), listing.agent_id);
+        let royalty_info = Self::get_royalty(env.clone(), listing.agent_id);
 
         // ─── VALIDATION PHASE ───
         // (Assuming approval status and expiry already checked in caller)
@@ -758,7 +775,7 @@ impl MarketplaceContract {
         let mut auction = get_auction(&env, auction_id).expect("Auction not found");
         let approval = get_approval(&env, approval_id).expect("Approval not found");
         let platform_fee_bps = Self::get_platform_fee(env.clone());
-        let royalty_info = Marketplace::get_royalty(env.clone(), auction.agent_id);
+        let royalty_info = Self::get_royalty(env.clone(), auction.agent_id);
         let now = env.ledger().timestamp();
 
         // ─── VALIDATION PHASE ───
@@ -1185,7 +1202,7 @@ impl MarketplaceContract {
             "Not a Dutch auction"
         );
 
-        let current_price = Marketplace::calculate_dutch_price(env.clone(), auction_id);
+        let current_price = Self::calculate_dutch_price(env.clone(), auction_id);
 
         let token_client = token::Client::new(&env, &get_payment_token(&env));
         token_client.transfer(&buyer, &env.current_contract_address(), &current_price);

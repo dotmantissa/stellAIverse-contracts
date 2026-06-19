@@ -11,6 +11,7 @@ pub trait AtomicTransactionSupport {
         step_id: u32,
         function: &Symbol,
         args: &Vec<Val>,
+        step: &TransactionStep, // Added step parameter to check dependencies
     ) -> bool;
 
     /// Commit phase: execute the prepared step

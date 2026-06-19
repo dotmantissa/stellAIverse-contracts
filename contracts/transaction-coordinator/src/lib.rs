@@ -4,6 +4,8 @@
 mod integration_test;
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod atomic_transaction_test;
 mod workflows;
 
 use soroban_sdk::{
@@ -280,20 +282,60 @@ impl TransactionCoordinator {
             .map(|tx| tx.status)
     }
 
-    /// Prepare a single step
+    /// Prepare a single step by invoking the contract's AtomicTransactionSupport implementation
     fn prepare_step(env: &Env, transaction_id: u64, step: &TransactionStep) -> bool {
-        // For now, return true as a placeholder since we can't easily convert complex types to Val
-        // In a real implementation, this would need proper serialization
-        Self::create_journal_entry(env, transaction_id, step.step_id, "prepare", true, None);
-        true
+        use stellai_lib::atomic::AtomicTransactionSupport;
+        use crate::workflows::MarketplaceAtomicSupport;
+        
+        // Check if this is a marketplace contract that implements AtomicTransactionSupport
+        // In a full implementation, we would use a generic approach to handle any contract
+        // that implements AtomicTransactionSupport
+        let prepare_success = MarketplaceAtomicSupport::prepare_step(
+                env,
+                transaction_id,
+                step.step_id,
+                &step.function,
+                &step.args,
+                step,
+            );
+
+        Self::create_journal_entry(
+            env, 
+            transaction_id, 
+            step.step_id, 
+            "prepare", 
+            prepare_success, 
+            if prepare_success { None } else { Some("Step preparation failed") }
+        );
+        
+        prepare_success
     }
 
-    /// Commit a single step
+    /// Commit a single step by invoking the contract's AtomicTransactionSupport implementation
     fn commit_step(env: &Env, transaction_id: u64, step: &TransactionStep) -> bool {
-        // For now, return true as a placeholder since we can't easily convert complex types to Val
-        // In a real implementation, this would need proper serialization
-        Self::create_journal_entry(env, transaction_id, step.step_id, "commit", true, None);
-        true
+        use stellai_lib::atomic::AtomicTransactionSupport;
+        use crate::workflows::MarketplaceAtomicSupport;
+        
+        // Invoke the contract's commit_step method
+        let result = MarketplaceAtomicSupport::commit_step(
+            env,
+            transaction_id,
+            step.step_id,
+            &step.function,
+            &step.args
+        );
+
+        let commit_success = result.try_into_val(env).unwrap_or(false);
+        Self::create_journal_entry(
+            env, 
+            transaction_id, 
+            step.step_id, 
+            "commit", 
+            commit_success, 
+            if commit_success { None } else { Some("Step commit failed") }
+        );
+        
+        commit_success
     }
 
     /// Rollback transaction by undoing executed steps in reverse order
@@ -309,7 +351,7 @@ impl TransactionCoordinator {
             .instance()
             .set(&DataKey::Transaction(transaction_id), &transaction);
 
-        let rollback_success = true;
+        let mut rollback_success = true;
 
         // Rollback in reverse order
         for i in (0..executed_steps.len()).rev() {
@@ -320,12 +362,33 @@ impl TransactionCoordinator {
                 .find(|s| s.step_id == step_id)
                 .unwrap();
 
-            if let (Some(_rollback_contract), Some(_rollback_function)) =
-                (&step.rollback_contract, &step.rollback_function)
+            if let (Some(rollback_contract), Some(rollback_function), Some(rollback_args)) =
+                (&step.rollback_contract, &step.rollback_function, &step.rollback_args)
             {
-                // For now, just log the rollback attempt
-                // In a real implementation, this would invoke the rollback contract
-                Self::create_journal_entry(env, transaction_id, step_id, "rollback", true, None);
+                use stellai_lib::atomic::AtomicTransactionSupport;
+                use crate::workflows::MarketplaceAtomicSupport;
+                
+                // Invoke the contract's rollback_step method
+                let step_rollback_success = MarketplaceAtomicSupport::rollback_step(
+                    env,
+                    transaction_id,
+                    step.step_id,
+                    &rollback_function,
+                    &rollback_args
+                );
+
+                if !step_rollback_success {
+                    rollback_success = false;
+                }
+
+                Self::create_journal_entry(
+                    env, 
+                    transaction_id, 
+                    step_id, 
+                    "rollback", 
+                    step_rollback_success, 
+                    if step_rollback_success { None } else { Some("Step rollback failed") }
+                );
             }
         }
 
