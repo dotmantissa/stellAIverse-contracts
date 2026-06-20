@@ -1,7 +1,10 @@
-use soroban_sdk::{Address, Env, String, Symbol, Vec};
+use soroban_sdk::{token, Address, Env, String, Symbol, Vec};
 
 use crate::payment_types::{PaymentRecord, PaymentSplit, PaymentStatus, RoyaltyPaymentSplit};
 use crate::storage;
+use stellai_lib::{
+    AssetClass, AssetClassRoyaltySettings, RoyaltyConfig, RoyaltyPaymentRecord, RoyaltyRecipient,
+};
 
 /// Maximum royalty rate that can be routed (25% = 2500 bps).
 pub const MAX_ROYALTY_CAP_BPS: u32 = 2500;
@@ -16,6 +19,8 @@ pub struct PaymentRoutingContext {
     pub platform_address: Address,
     /// Ordered royalty recipients (creator, previous owner, etc.).
     pub royalty_recipients: Vec<(Address, u32, String)>,
+    /// Asset class for royalty configuration
+    pub asset_class: AssetClass,
 }
 
 /// Calculate how a sale price should be distributed between royalty recipients, the platform, and the seller.
@@ -92,7 +97,20 @@ pub fn execute_payment_routing(env: &Env, split: RoyaltyPaymentSplit) {
         record_splits.push_back((entry.recipient.clone(), entry.amount, entry.label.clone()));
     }
 
-    // TODO: Replace this placeholder with actual token transfers via token::Client.
+    // Execute actual token transfers
+    let payment_token = storage::get_payment_token(env);
+    let token_client = token::Client::new(env, &payment_token);
+
+    for i in 0..split.splits.len() {
+        let entry = split.splits.get(i).unwrap();
+        if entry.amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &entry.recipient,
+                &entry.amount,
+            );
+        }
+    }
 
     let payment_id = storage::increment_payment_counter(env);
     let record = PaymentRecord {
@@ -117,6 +135,170 @@ pub fn execute_payment_routing(env: &Env, split: RoyaltyPaymentSplit) {
             record.splits,
         ),
     );
+}
+
+/// Calculate royalties with complex splits and automatic distribution
+pub fn calculate_and_distribute_royalties(
+    env: &Env,
+    agent_id: u64,
+    sale_price: i128,
+    asset_class: AssetClass,
+    transaction_id: u64,
+) -> Result<RoyaltyPaymentRecord, &'static str> {
+    // Get asset class settings or use defaults
+    let settings = storage::get_asset_class_royalty_settings(env, asset_class)
+        .unwrap_or_else(|| storage::get_default_asset_class_settings(env, asset_class));
+
+    // Check minimum threshold
+    if sale_price < settings.min_threshold {
+        return Err("Sale price below minimum royalty threshold");
+    }
+
+    // Get agent-specific royalty configuration if exists
+    let royalty_config = storage::get_royalty_config(env, agent_id);
+
+    // Determine royalty recipients and rates
+    let recipients = if let Some(config) = royalty_config {
+        // Use agent-specific configuration
+        config.recipients
+    } else {
+        // Use default single recipient (creator from legacy RoyaltyInfo)
+        let legacy_royalty = storage::get_royalty(env, agent_id);
+        if let Some(info) = legacy_royalty {
+            let mut default_recipients = Vec::new(env);
+            default_recipients.push_back(RoyaltyRecipient {
+                recipient: info.recipient,
+                share_bps: info.fee,
+                role: String::from_str(env, "creator"),
+            });
+            default_recipients
+        } else {
+            // Use asset class default
+            let mut default_recipients = Vec::new(env);
+            // Note: In a real implementation, you'd need to get the creator address
+            // For now, we'll skip royalties if no config exists
+            return Err("No royalty configuration found");
+        }
+    };
+
+    // Calculate total royalty amount
+    let total_royalty_bps: u32 = recipients.iter().map(|r| r.share_bps).sum();
+    let total_royalty = (sale_price * (total_royalty_bps as i128)) / 10_000;
+
+    // Apply maximum cap if configured
+    let final_royalty = if let Some(config) = &royalty_config {
+        if let Some(cap) = config.max_cap {
+            total_royalty.min(cap)
+        } else {
+            total_royalty
+        }
+    } else {
+        total_royalty
+    };
+
+    // Calculate individual shares
+    let mut payment_recipients = Vec::new(env);
+    let mut royalty_amounts = Vec::new(env);
+
+    for i in 0..recipients.len() {
+        let recipient = recipients.get(i).unwrap();
+        let share_amount = (final_royalty * (recipient.share_bps as i128)) / total_royalty_bps;
+        payment_recipients.push_back((
+            recipient.recipient.clone(),
+            share_amount,
+            recipient.role.clone(),
+        ));
+        royalty_amounts.push_back(share_amount);
+    }
+
+    // Execute token transfers
+    let payment_token = storage::get_payment_token(env);
+    let token_client = token::Client::new(env, &payment_token);
+
+    for i in 0..payment_recipients.len() {
+        let (recipient, amount, _role) = payment_recipients.get(i).unwrap();
+        if *amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                recipient,
+                amount,
+            );
+        }
+    }
+
+    // Create royalty payment record for audit trail
+    let payment_id = storage::increment_royalty_payment_counter(env);
+    let royalty_record = RoyaltyPaymentRecord {
+        payment_id,
+        agent_id,
+        transaction_id,
+        sale_price,
+        total_royalty_paid: final_royalty,
+        recipients: payment_recipients.clone(),
+        timestamp: env.ledger().timestamp(),
+        asset_class,
+    };
+
+    // Store record and add to history
+    storage::set_royalty_payment_record(env, &royalty_record);
+    storage::add_royalty_payment_history(env, agent_id, payment_id);
+
+    // Emit event
+    env.events().publish(
+        (Symbol::new(env, "RoyaltyPaymentDistributed"),),
+        (
+            payment_id,
+            agent_id,
+            final_royalty,
+            payment_recipients.len() as u64,
+        ),
+    );
+
+    Ok(royalty_record)
+}
+
+/// Validate royalty configuration before setting it
+pub fn validate_royalty_config(
+    config: &RoyaltyConfig,
+    asset_class: AssetClass,
+    env: &Env,
+) -> Result<(), &'static str> {
+    // Check total basis points doesn't exceed 10000 (100%)
+    if config.total_bps > 10000 {
+        return Err("Total royalty basis points cannot exceed 10000");
+    }
+
+    // Check individual shares sum to total
+    let calculated_total: u32 = config.recipients.iter().map(|r| r.share_bps).sum();
+    if calculated_total != config.total_bps {
+        return Err("Individual royalty shares must sum to total basis points");
+    }
+
+    // Validate against asset class limits
+    let settings = storage::get_asset_class_royalty_settings(env, asset_class)
+        .unwrap_or_else(|| storage::get_default_asset_class_settings(env, asset_class));
+
+    if config.total_bps < settings.min_royalty_bps {
+        return Err("Total royalty below minimum for asset class");
+    }
+
+    if config.total_bps > settings.max_royalty_bps {
+        return Err("Total royalty exceeds maximum for asset class");
+    }
+
+    // Check minimum threshold is positive
+    if config.min_threshold < 0 {
+        return Err("Minimum threshold cannot be negative");
+    }
+
+    // Check max cap is positive if set
+    if let Some(cap) = config.max_cap {
+        if cap < 0 {
+            return Err("Maximum cap cannot be negative");
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

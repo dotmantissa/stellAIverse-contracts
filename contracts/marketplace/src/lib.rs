@@ -11,7 +11,10 @@ mod test_bid_history;
 mod test_dynamic_fee_enhancement;
 
 use payment_types::PaymentRecord;
-use payments::{calculate_splits, execute_payment_routing, PaymentRoutingContext};
+use payments::{
+    calculate_and_distribute_royalties, calculate_splits, execute_payment_routing,
+    PaymentRoutingContext, validate_royalty_config,
+};
 use soroban_sdk::{
     contract, contractimpl, token, Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol,
     TryIntoVal, Val, Vec,
@@ -23,8 +26,9 @@ use stellai_lib::{
     storage_keys::LISTING_COUNTER_KEY,
     types::{
         Approval, ApprovalConfig, ApprovalHistory, ApprovalStatus, Auction, AuctionStatus,
-        AuctionType, BidRecord, LeaseData, LeaseExtensionRequest, LeaseHistoryEntry, LeaseState,
-        Listing, ListingType, RoyaltyInfo,
+        AuctionType, AssetClass, AssetClassRoyaltySettings, BidRecord, LeaseData,
+        LeaseExtensionRequest, LeaseHistoryEntry, LeaseState, Listing, ListingType, RoyaltyConfig,
+        RoyaltyInfo, RoyaltyPaymentRecord, RoyaltyRecipient,
     },
     validation,
 };
@@ -244,7 +248,7 @@ impl MarketplaceContract {
         }
     }
 
-    /// Helper to route payment for a completed sale.
+    /// Helper to route payment for a completed sale with automated royalty distribution.
     fn route_sale_payment(
         env: &Env,
         agent_id: u64,
@@ -253,25 +257,47 @@ impl MarketplaceContract {
         seller: &Address,
         royalty_info: Option<RoyaltyInfo>,
         platform_fee_bps: u32,
+        asset_class: AssetClass,
     ) {
-        let mut royalty_recipients = Vec::new(env);
-        let mut royalty_rate = 0u32;
+        // First, attempt automated royalty distribution
+        let transaction_id = env.ledger().sequence() as u64;
+        let royalty_result = calculate_and_distribute_royalties(
+            env,
+            agent_id,
+            sale_price,
+            asset_class,
+            transaction_id,
+        );
 
-        if let Some(info) = royalty_info {
-            royalty_rate = info.fee;
-            royalty_recipients.push_back((
-                info.recipient,
-                royalty_rate,
-                String::from_str(env, "creator"),
-            ));
-        }
+        // If automated royalty distribution succeeded, use it
+        // Otherwise, fall back to legacy payment routing
+        let (royalty_recipients, royalty_rate) = if royalty_result.is_ok() {
+            // Royalties already distributed, skip in payment routing
+            (Vec::new(env), 0u32)
+        } else {
+            // Fall back to legacy routing
+            let mut recipients = Vec::new(env);
+            let mut rate = 0u32;
+
+            if let Some(info) = royalty_info {
+                rate = info.fee;
+                recipients.push_back((
+                    info.recipient,
+                    rate,
+                    String::from_str(env, "creator"),
+                ));
+            }
+            (recipients, rate)
+        };
+
         let context = PaymentRoutingContext {
             agent_id,
-            transaction_id: env.ledger().sequence() as u64,
+            transaction_id,
             buyer: buyer.clone(),
             seller: seller.clone(),
             platform_address: env.current_contract_address(),
             royalty_recipients,
+            asset_class,
         };
 
         let split = calculate_splits(env, sale_price, royalty_rate, platform_fee_bps, &context);
@@ -365,6 +391,129 @@ impl MarketplaceContract {
 
         let royalty_key = (Symbol::new(&env, "royalty"), agent_id);
         env.storage().instance().get(&royalty_key)
+    }
+
+    // ---------------- ROYALTY AUTOMATION ----------------
+
+    /// Set royalty configuration for an agent with multiple recipients
+    pub fn set_royalty_config(
+        env: Env,
+        admin: Address,
+        agent_id: u64,
+        recipients: Vec<RoyaltyRecipient>,
+        total_bps: u32,
+        min_threshold: i128,
+        max_cap: Option<i128>,
+        asset_class: AssetClass,
+    ) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+
+        if validation::validate_nonzero_id(agent_id).is_err() {
+            panic!("Invalid agent ID");
+        }
+
+        let config = RoyaltyConfig {
+            recipients: recipients.clone(),
+            total_bps,
+            min_threshold,
+            max_cap,
+        };
+
+        // Validate configuration
+        validate_royalty_config(&config, asset_class, &env)
+            .expect("Invalid royalty configuration");
+
+        storage::set_royalty_config(&env, agent_id, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "royalty_config_set"),),
+            (agent_id, total_bps, recipients.len() as u64),
+        );
+    }
+
+    /// Get royalty configuration for an agent
+    pub fn get_royalty_config(env: Env, agent_id: u64) -> Option<RoyaltyConfig> {
+        if validation::validate_nonzero_id(agent_id).is_err() {
+            panic!("Invalid agent ID");
+        }
+
+        storage::get_royalty_config(&env, agent_id)
+    }
+
+    /// Set royalty settings for an asset class (admin only)
+    pub fn set_asset_class_royalty_settings(
+        env: Env,
+        admin: Address,
+        asset_class: AssetClass,
+        default_royalty_bps: u32,
+        min_royalty_bps: u32,
+        max_royalty_bps: u32,
+        min_threshold: i128,
+    ) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+
+        let settings = AssetClassRoyaltySettings {
+            asset_class,
+            default_royalty_bps,
+            min_royalty_bps,
+            max_royalty_bps,
+            min_threshold,
+        };
+
+        storage::set_asset_class_royalty_settings(&env, asset_class, &settings);
+
+        env.events().publish(
+            (Symbol::new(&env, "asset_class_royalty_settings_set"),),
+            (asset_class as u32, default_royalty_bps),
+        );
+    }
+
+    /// Get royalty settings for an asset class
+    pub fn get_asset_class_royalty_settings(
+        env: Env,
+        asset_class: AssetClass,
+    ) -> AssetClassRoyaltySettings {
+        storage::get_asset_class_royalty_settings(&env, asset_class)
+            .unwrap_or_else(|| storage::get_default_asset_class_settings(&env, asset_class))
+    }
+
+    /// Get royalty payment history for an agent
+    pub fn get_royalty_payment_history(env: Env, agent_id: u64) -> Vec<RoyaltyPaymentRecord> {
+        if validation::validate_nonzero_id(agent_id).is_err() {
+            panic!("Invalid agent ID");
+        }
+
+        let mut history = Vec::new(&env);
+        let count = storage::get_royalty_payment_history_count(&env, agent_id);
+
+        for i in 0..count {
+            if let Some(payment_id) = storage::get_royalty_payment_history_entry(&env, agent_id, i) {
+                if let Some(record) = storage::get_royalty_payment_record(&env, payment_id) {
+                    history.push_back(record);
+                }
+            }
+        }
+
+        history
+    }
+
+    /// Get total royalties paid for an agent
+    pub fn get_total_royalties_paid(env: Env, agent_id: u64) -> i128 {
+        if validation::validate_nonzero_id(agent_id).is_err() {
+            panic!("Invalid agent ID");
+        }
+
+        let history = Self::get_royalty_payment_history(env, agent_id);
+        let mut total = 0i128;
+
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            total = total + record.total_royalty_paid;
+        }
+
+        total
     }
 
     // ---------------- MULTI-SIGNATURE APPROVAL ----------------
@@ -741,6 +890,7 @@ impl MarketplaceContract {
             &listing.seller,
             royalty_info,
             platform_fee_bps,
+            AssetClass::Agent,
         );
 
         // Mark listing as inactive
@@ -796,6 +946,7 @@ impl MarketplaceContract {
                     &auction.seller,
                     royalty_info,
                     platform_fee_bps,
+                    AssetClass::Agent,
                 );
 
                 // NOTE: NFT transfer logic should be added here
@@ -1303,6 +1454,7 @@ impl MarketplaceContract {
                         &auction.seller,
                         royalty_info.clone(),
                         platform_fee_bps,
+                        AssetClass::Agent,
                     );
 
                     // Refund winner excess deposit if any
@@ -1329,6 +1481,7 @@ impl MarketplaceContract {
                         &auction.seller,
                         royalty_info.clone(),
                         platform_fee_bps,
+                        AssetClass::Agent,
                     );
 
                     // NOTE: NFT transfer logic should be added here
@@ -1975,6 +2128,7 @@ impl MarketplaceContract {
             &escrow.seller,
             royalty_info,
             platform_fee_bps,
+            AssetClass::Agent,
         );
 
         // Update escrow status
@@ -2043,6 +2197,7 @@ impl MarketplaceContract {
                 &escrow.seller,
                 royalty_info,
                 platform_fee_bps,
+                AssetClass::Agent,
             );
             escrow.status = EscrowStatus::Released;
         } else {
@@ -2085,6 +2240,7 @@ impl MarketplaceContract {
                     &escrow.seller,
                     royalty_info,
                     platform_fee_bps,
+                    AssetClass::Agent,
                 );
 
                 escrow.status = EscrowStatus::Released;

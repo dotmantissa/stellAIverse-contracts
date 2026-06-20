@@ -153,12 +153,76 @@ pub struct RoyaltyInfo {
     pub fee: u32,
 }
 
+/// Individual royalty recipient with share percentage
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct RoyaltyRecipient {
+    pub recipient: Address,
+    pub share_bps: u32, // Basis points (0-10000)
+    pub role: String,   // "creator", "collaborator", "platform", etc.
+}
+
+/// Complex royalty configuration supporting multiple recipients
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct RoyaltyConfig {
+    pub recipients: Vec<RoyaltyRecipient>,
+    pub total_bps: u32, // Total basis points (should equal sum of shares)
+    pub min_threshold: i128, // Minimum sale price to trigger royalties
+    pub max_cap: Option<i128>, // Optional maximum royalty amount
+}
+
+/// Asset class for royalty configuration
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+#[repr(u32)]
+pub enum AssetClass {
+    Agent = 0,
+    Model = 1,
+    Dataset = 2,
+    Tool = 3,
+    Other = 4,
+}
+
+/// Royalty settings per asset class
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct AssetClassRoyaltySettings {
+    pub asset_class: AssetClass,
+    pub default_royalty_bps: u32,
+    pub min_royalty_bps: u32,
+    pub max_royalty_bps: u32,
+    pub min_threshold: i128,
+}
+
+/// Royalty payment record for audit trail
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct RoyaltyPaymentRecord {
+    pub payment_id: u64,
+    pub agent_id: u64,
+    pub transaction_id: u64,
+    pub sale_price: i128,
+    pub total_royalty_paid: i128,
+    pub recipients: Vec<(Address, i128, String)>, // (recipient, amount, role)
+    pub timestamp: u64,
+    pub asset_class: AssetClass,
+}
+
 /// Wrapper enum so Option<RoyaltyInfo> works inside contracttype structs
 #[derive(Clone, Debug)]
 #[contracttype]
 pub enum OptionalRoyaltyInfo {
     None,
     Some(RoyaltyInfo),
+}
+
+/// Wrapper enum so Option<RoyaltyConfig> works inside contracttype structs
+#[derive(Clone, Debug)]
+#[contracttype]
+pub enum OptionalRoyaltyConfig {
+    None,
+    Some(RoyaltyConfig),
 }
 
 #[contracttype]

@@ -77,6 +77,13 @@ pub enum DataKey {
     Escrow(u64),                 // Individual escrow entry by ID
     BuyerEscrows(Address, u64),  // (buyer address, escrow_id)
     SellerEscrows(Address, u64), // (seller address, escrow_id)
+    // Royalty automation storage keys
+    RoyaltyConfig(u64), // Agent-specific royalty configuration
+    AssetClassRoyaltySettings(stellai_lib::AssetClass), // Per asset class settings
+    RoyaltyPaymentCounter,
+    RoyaltyPaymentRecord(u64),
+    RoyaltyPaymentHistory(u64, u64), // (agent_id, history_index)
+    RoyaltyPaymentHistoryCount(u64),
 }
 
 /* ---------------- ADMIN ---------------- */
@@ -883,4 +890,144 @@ pub fn get_seller_escrows(env: &Env, seller: &Address) -> Vec<u64> {
         index += 1;
     }
     escrows
+}
+
+/* ---------------- ROYALTY AUTOMATION ---------------- */
+
+/// Set royalty configuration for a specific agent
+pub fn set_royalty_config(env: &Env, agent_id: u64, config: &stellai_lib::RoyaltyConfig) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RoyaltyConfig(agent_id), config);
+}
+
+/// Get royalty configuration for a specific agent
+pub fn get_royalty_config(env: &Env, agent_id: u64) -> Option<stellai_lib::RoyaltyConfig> {
+    env.storage()
+        .instance()
+        .get(&DataKey::RoyaltyConfig(agent_id))
+}
+
+/// Set royalty settings for an asset class
+pub fn set_asset_class_royalty_settings(
+    env: &Env,
+    asset_class: stellai_lib::AssetClass,
+    settings: &stellai_lib::AssetClassRoyaltySettings,
+) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AssetClassRoyaltySettings(asset_class), settings);
+}
+
+/// Get royalty settings for an asset class
+pub fn get_asset_class_royalty_settings(
+    env: &Env,
+    asset_class: stellai_lib::AssetClass,
+) -> Option<stellai_lib::AssetClassRoyaltySettings> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AssetClassRoyaltySettings(asset_class))
+}
+
+/// Get default asset class settings (fallback values)
+pub fn get_default_asset_class_settings(
+    env: &Env,
+    asset_class: stellai_lib::AssetClass,
+) -> stellai_lib::AssetClassRoyaltySettings {
+    match asset_class {
+        stellai_lib::AssetClass::Agent => stellai_lib::AssetClassRoyaltySettings {
+            asset_class: stellai_lib::AssetClass::Agent,
+            default_royalty_bps: 500, // 5%
+            min_royalty_bps: 0,
+            max_royalty_bps: 2500, // 25%
+            min_threshold: 1000, // Minimum sale price to trigger royalties
+        },
+        stellai_lib::AssetClass::Model => stellai_lib::AssetClassRoyaltySettings {
+            asset_class: stellai_lib::AssetClass::Model,
+            default_royalty_bps: 1000, // 10%
+            min_royalty_bps: 0,
+            max_royalty_bps: 2500,
+            min_threshold: 500,
+        },
+        stellai_lib::AssetClass::Dataset => stellai_lib::AssetClassRoyaltySettings {
+            asset_class: stellai_lib::AssetClass::Dataset,
+            default_royalty_bps: 300, // 3%
+            min_royalty_bps: 0,
+            max_royalty_bps: 1500, // 15%
+            min_threshold: 200,
+        },
+        stellai_lib::AssetClass::Tool => stellai_lib::AssetClassRoyaltySettings {
+            asset_class: stellai_lib::AssetClass::Tool,
+            default_royalty_bps: 750, // 7.5%
+            min_royalty_bps: 0,
+            max_royalty_bps: 2000, // 20%
+            min_threshold: 100,
+        },
+        stellai_lib::AssetClass::Other => stellai_lib::AssetClassRoyaltySettings {
+            asset_class: stellai_lib::AssetClass::Other,
+            default_royalty_bps: 500, // 5%
+            min_royalty_bps: 0,
+            max_royalty_bps: 2500,
+            min_threshold: 100,
+        },
+    }
+}
+
+/// Increment royalty payment counter
+pub fn increment_royalty_payment_counter(env: &Env) -> u64 {
+    let counter: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::RoyaltyPaymentCounter)
+        .unwrap_or(0);
+    let updated = counter + 1;
+    env.storage()
+        .instance()
+        .set(&DataKey::RoyaltyPaymentCounter, &updated);
+    updated
+}
+
+/// Set royalty payment record
+pub fn set_royalty_payment_record(env: &Env, record: &stellai_lib::RoyaltyPaymentRecord) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RoyaltyPaymentRecord(record.payment_id), record);
+}
+
+/// Get royalty payment record
+pub fn get_royalty_payment_record(
+    env: &Env,
+    payment_id: u64,
+) -> Option<stellai_lib::RoyaltyPaymentRecord> {
+    env.storage()
+        .instance()
+        .get(&DataKey::RoyaltyPaymentRecord(payment_id))
+}
+
+/// Add royalty payment to history
+pub fn add_royalty_payment_history(env: &Env, agent_id: u64, payment_id: u64) {
+    let index = get_royalty_payment_history_count(env, agent_id);
+    env.storage()
+        .instance()
+        .set(&DataKey::RoyaltyPaymentHistory(agent_id, index), &payment_id);
+}
+
+/// Get royalty payment history count for an agent
+pub fn get_royalty_payment_history_count(env: &Env, agent_id: u64) -> u64 {
+    let mut count = 0;
+    while env
+        .storage()
+        .instance()
+        .has(&DataKey::RoyaltyPaymentHistory(agent_id, count))
+    {
+        count += 1;
+    }
+    count
+}
+
+/// Get royalty payment history entry
+pub fn get_royalty_payment_history_entry(env: &Env, agent_id: u64, index: u64) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::RoyaltyPaymentHistory(agent_id, index))
 }
