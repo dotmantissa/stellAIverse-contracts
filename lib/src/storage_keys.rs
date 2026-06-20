@@ -21,3 +21,8 @@ pub const APPROVAL_CONFIG_KEY: &str = "approval_config";
 pub const APPROVAL_COUNTER_KEY: &str = "approval_counter";
 pub const APPROVAL_KEY_PREFIX: &str = "approval_";
 pub const APPROVAL_HISTORY_KEY_PREFIX: &str = "approval_history_";
+
+// Oracle subscription keys
+pub const SUB_PLAN_KEY_PREFIX: &str = "sub_plan_";
+pub const SUBSCRIPTION_KEY_PREFIX: &str = "subscription_";
+pub const SUB_USAGE_KEY_PREFIX: &str = "sub_usage_";

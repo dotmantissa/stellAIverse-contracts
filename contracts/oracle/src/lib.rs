@@ -10,12 +10,76 @@ use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, S
 use stellai_lib::{
     audit::{create_audit_log, OperationType},
     rbac,
-    storage_keys::PROVIDER_LIST_KEY,
+    storage_keys::{PROVIDER_LIST_KEY, SUB_PLAN_KEY_PREFIX, SUB_USAGE_KEY_PREFIX, SUBSCRIPTION_KEY_PREFIX},
     types::OracleData,
     ADMIN_KEY,
 };
 
 pub use types::*;
+
+// ── storage key helpers ────────────────────────────────────────────────────
+
+fn plan_key(env: &Env, feed_key: &Symbol, tier: SubscriptionTier) -> String {
+    let tier_u32: u32 = tier as u32;
+    // encode as "sub_plan_<feed>_<tier>"
+    let mut key = soroban_sdk::String::from_str(env, SUB_PLAN_KEY_PREFIX);
+    let feed_str = feed_key.to_string();
+    key = concat_strings(env, &key, &feed_str);
+    key = concat_strings(env, &key, &soroban_sdk::String::from_str(env, "_"));
+    key = concat_strings(env, &key, &u32_to_string(env, tier_u32));
+    key
+}
+
+fn subscription_key(env: &Env, subscriber: &Address, feed_key: &Symbol) -> String {
+    let mut key = soroban_sdk::String::from_str(env, SUBSCRIPTION_KEY_PREFIX);
+    let feed_str = feed_key.to_string();
+    key = concat_strings(env, &key, &feed_str);
+    key = concat_strings(env, &key, &soroban_sdk::String::from_str(env, "_"));
+    // use subscriber address bytes as discriminator via a simple hash
+    let addr_bytes = subscriber.to_string();
+    key = concat_strings(env, &key, &addr_bytes);
+    key
+}
+
+fn usage_key(env: &Env, subscriber: &Address, feed_key: &Symbol) -> String {
+    let mut key = soroban_sdk::String::from_str(env, SUB_USAGE_KEY_PREFIX);
+    let feed_str = feed_key.to_string();
+    key = concat_strings(env, &key, &feed_str);
+    key = concat_strings(env, &key, &soroban_sdk::String::from_str(env, "_"));
+    key = concat_strings(env, &key, &subscriber.to_string());
+    key
+}
+
+fn concat_strings(env: &Env, a: &String, b: &String) -> String {
+    let a_len = a.len();
+    let b_len = b.len();
+    let mut buf = soroban_sdk::Bytes::new(env);
+    for i in 0..a_len {
+        buf.push_back(a.get(i).unwrap());
+    }
+    for i in 0..b_len {
+        buf.push_back(b.get(i).unwrap());
+    }
+    String::from_bytes(env, &buf)
+}
+
+fn u32_to_string(env: &Env, mut n: u32) -> String {
+    if n == 0 {
+        return String::from_str(env, "0");
+    }
+    let mut digits: [u8; 10] = [0u8; 10];
+    let mut idx = 10usize;
+    while n > 0 {
+        idx -= 1;
+        digits[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    let slice = &digits[idx..];
+    let bytes = soroban_sdk::Bytes::from_slice(env, slice);
+    String::from_bytes(env, &bytes)
+}
+
+// ── contract ──────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct Oracle;
@@ -285,5 +349,204 @@ impl Oracle {
         );
 
         result
+    }
+
+    // ── Subscription system ─────────────────────────────────────────────────────
+
+    /// Admin: create or update a subscription plan for a feed/tier.
+    pub fn create_plan(
+        env: Env,
+        admin: Address,
+        feed_key: Symbol,
+        tier: SubscriptionTier,
+        price_per_period: i128,
+        period_seconds: u64,
+        max_calls_per_period: u32,
+    ) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+
+        if price_per_period < 0 {
+            panic!("Invalid price");
+        }
+        if period_seconds == 0 {
+            panic!("Invalid period");
+        }
+
+        let plan = SubscriptionPlan {
+            feed_key: feed_key.clone(),
+            tier,
+            price_per_period,
+            period_seconds,
+            max_calls_per_period,
+            active: true,
+        };
+
+        let key = plan_key(&env, &feed_key, tier);
+        env.storage().instance().set(&key, &plan);
+
+        env.events().publish(
+            (Symbol::new(&env, "plan_created"),),
+            (feed_key, tier as u32, price_per_period, period_seconds),
+        );
+    }
+
+    /// Admin: deactivate a subscription plan.
+    pub fn deactivate_plan(env: Env, admin: Address, feed_key: Symbol, tier: SubscriptionTier) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+
+        let key = plan_key(&env, &feed_key, tier);
+        let mut plan: SubscriptionPlan = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic!("Plan not found"));
+        plan.active = false;
+        env.storage().instance().set(&key, &plan);
+    }
+
+    /// Subscribe (or renew) to an oracle feed for one period.
+    /// Caller must have already transferred `plan.price_per_period` to this contract.
+    /// For simplicity on Soroban, payment is verified off-chain / via token contract
+    /// before calling; the contract records the subscription state.
+    pub fn subscribe(
+        env: Env,
+        subscriber: Address,
+        feed_key: Symbol,
+        tier: SubscriptionTier,
+        auto_renew: bool,
+    ) {
+        subscriber.require_auth();
+
+        let key = plan_key(&env, &feed_key, tier);
+        let plan: SubscriptionPlan = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic!("Plan not found"));
+
+        if !plan.active {
+            panic!("Plan is not active");
+        }
+
+        let now = env.ledger().timestamp();
+        let sub_key = subscription_key(&env, &subscriber, &feed_key);
+
+        // If an active subscription exists, extend from its expiry; else start now.
+        let existing: Option<Subscription> = env.storage().instance().get(&sub_key);
+        let base = match &existing {
+            Some(s) if s.expires_at > now => s.expires_at,
+            _ => now,
+        };
+
+        let sub = Subscription {
+            subscriber: subscriber.clone(),
+            feed_key: feed_key.clone(),
+            tier,
+            expires_at: base + plan.period_seconds,
+            calls_used: 0,
+            calls_limit: plan.max_calls_per_period,
+            auto_renew,
+            created_at: existing.as_ref().map(|s| s.created_at).unwrap_or(now),
+        };
+
+        env.storage().instance().set(&sub_key, &sub);
+        // Reset usage counter for the new period
+        let u_key = usage_key(&env, &subscriber, &feed_key);
+        env.storage().instance().set(&u_key, &0u32);
+
+        env.events().publish(
+            (Symbol::new(&env, "subscribed"),),
+            (subscriber, feed_key, tier as u32, sub.expires_at),
+        );
+    }
+
+    /// Renew an existing subscription for one more period (same tier).
+    /// Mirrors subscribe but requires the subscription to already exist.
+    pub fn renew(
+        env: Env,
+        subscriber: Address,
+        feed_key: Symbol,
+    ) {
+        subscriber.require_auth();
+
+        let sub_key = subscription_key(&env, &subscriber, &feed_key);
+        let sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&sub_key)
+            .unwrap_or_else(|| panic!("No subscription found"));
+
+        // Delegate to subscribe with same tier and auto_renew setting
+        Self::subscribe(env, subscriber, feed_key, sub.tier, sub.auto_renew);
+    }
+
+    /// Cancel a subscription (disables auto-renew; access valid until expiry).
+    pub fn cancel(env: Env, subscriber: Address, feed_key: Symbol) {
+        subscriber.require_auth();
+
+        let sub_key = subscription_key(&env, &subscriber, &feed_key);
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&sub_key)
+            .unwrap_or_else(|| panic!("No subscription found"));
+
+        sub.auto_renew = false;
+        env.storage().instance().set(&sub_key, &sub);
+
+        env.events().publish(
+            (Symbol::new(&env, "sub_cancelled"),),
+            (subscriber, feed_key),
+        );
+    }
+
+    /// Check whether a subscriber currently has valid access to a feed.
+    pub fn check_access(env: Env, subscriber: Address, feed_key: Symbol) -> bool {
+        let sub_key = subscription_key(&env, &subscriber, &feed_key);
+        let sub: Option<Subscription> = env.storage().instance().get(&sub_key);
+        match sub {
+            Some(s) => {
+                let now = env.ledger().timestamp();
+                s.expires_at > now && s.calls_used < s.calls_limit
+            }
+            None => false,
+        }
+    }
+
+    /// Increment usage counter for a subscriber's feed; panics if no valid access.
+    /// Called by oracle data consumers to track billing usage.
+    pub fn track_usage(env: Env, subscriber: Address, feed_key: Symbol) {
+        subscriber.require_auth();
+
+        if !Self::check_access(env.clone(), subscriber.clone(), feed_key.clone()) {
+            panic!("No active subscription or quota exceeded");
+        }
+
+        let sub_key = subscription_key(&env, &subscriber, &feed_key);
+        let mut sub: Subscription = env.storage().instance().get(&sub_key).unwrap();
+        sub.calls_used += 1;
+        env.storage().instance().set(&sub_key, &sub);
+
+        let u_key = usage_key(&env, &subscriber, &feed_key);
+        let current: u32 = env.storage().instance().get(&u_key).unwrap_or(0);
+        env.storage().instance().set(&u_key, &(current + 1));
+    }
+
+    /// Return the current subscription record for a subscriber/feed pair.
+    pub fn get_subscription(env: Env, subscriber: Address, feed_key: Symbol) -> Option<Subscription> {
+        let sub_key = subscription_key(&env, &subscriber, &feed_key);
+        env.storage().instance().get(&sub_key)
+    }
+
+    /// Return the subscription plan for a feed/tier.
+    pub fn get_plan(
+        env: Env,
+        feed_key: Symbol,
+        tier: SubscriptionTier,
+    ) -> Option<SubscriptionPlan> {
+        let key = plan_key(&env, &feed_key, tier);
+        env.storage().instance().get(&key)
     }
 }

@@ -254,3 +254,130 @@ fn test_relay_signed_rejects_expired_deadline() {
         &signature,
     );
 }
+
+// ── Subscription tests ─────────────────────────────────────────────────────
+
+use crate::SubscriptionTier;
+
+fn setup_with_plan(
+) -> (
+    Env,
+    OracleClient<'static>,
+    Address,
+    Symbol,
+) {
+    let (env, oracle, admin, _pk, _sk, _receiver_id) = setup();
+    let feed = Symbol::new(&env, "BTC_USD");
+    oracle.create_plan(
+        &admin,
+        &feed,
+        &SubscriptionTier::Basic,
+        &1_000_000i128, // 1 XLM
+        &86_400u64,     // 1 day
+        &100u32,        // 100 calls/period
+    );
+    (env, oracle, admin, feed)
+}
+
+#[test]
+fn test_create_plan_and_get_plan() {
+    let (env, oracle, _admin, feed) = setup_with_plan();
+    let plan = oracle.get_plan(&feed, &SubscriptionTier::Basic).unwrap();
+    assert_eq!(plan.price_per_period, 1_000_000);
+    assert_eq!(plan.period_seconds, 86_400);
+    assert_eq!(plan.max_calls_per_period, 100);
+    assert!(plan.active);
+}
+
+#[test]
+fn test_subscribe_creates_subscription() {
+    let (env, oracle, _admin, feed) = setup_with_plan();
+    let user = Address::generate(&env);
+
+    oracle.subscribe(&user, &feed, &SubscriptionTier::Basic, &false);
+
+    let sub = oracle.get_subscription(&user, &feed).unwrap();
+    assert_eq!(sub.calls_used, 0);
+    assert_eq!(sub.calls_limit, 100);
+    assert!(!sub.auto_renew);
+    assert!(sub.expires_at > env.ledger().timestamp());
+}
+
+#[test]
+fn test_check_access_active_subscription() {
+    let (env, oracle, _admin, feed) = setup_with_plan();
+    let user = Address::generate(&env);
+
+    assert!(!oracle.check_access(&user, &feed));
+    oracle.subscribe(&user, &feed, &SubscriptionTier::Basic, &true);
+    assert!(oracle.check_access(&user, &feed));
+}
+
+#[test]
+fn test_track_usage_increments_counter() {
+    let (env, oracle, _admin, feed) = setup_with_plan();
+    let user = Address::generate(&env);
+    oracle.subscribe(&user, &feed, &SubscriptionTier::Basic, &false);
+
+    oracle.track_usage(&user, &feed);
+    oracle.track_usage(&user, &feed);
+
+    let sub = oracle.get_subscription(&user, &feed).unwrap();
+    assert_eq!(sub.calls_used, 2);
+}
+
+#[test]
+fn test_cancel_disables_auto_renew() {
+    let (env, oracle, _admin, feed) = setup_with_plan();
+    let user = Address::generate(&env);
+    oracle.subscribe(&user, &feed, &SubscriptionTier::Basic, &true);
+
+    oracle.cancel(&user, &feed);
+
+    let sub = oracle.get_subscription(&user, &feed).unwrap();
+    assert!(!sub.auto_renew);
+    // Access still valid until expiry
+    assert!(oracle.check_access(&user, &feed));
+}
+
+#[test]
+fn test_renew_extends_expiry() {
+    let (env, oracle, _admin, feed) = setup_with_plan();
+    let user = Address::generate(&env);
+    oracle.subscribe(&user, &feed, &SubscriptionTier::Basic, &false);
+
+    let before = oracle.get_subscription(&user, &feed).unwrap().expires_at;
+    oracle.renew(&user, &feed);
+    let after = oracle.get_subscription(&user, &feed).unwrap().expires_at;
+
+    assert_eq!(after, before + 86_400);
+}
+
+#[test]
+#[should_panic(expected = "No active subscription or quota exceeded")]
+fn test_track_usage_fails_without_subscription() {
+    let (env, oracle, _admin, feed) = setup_with_plan();
+    let user = Address::generate(&env);
+    oracle.track_usage(&user, &feed);
+}
+
+#[test]
+#[should_panic(expected = "Plan is not active")]
+fn test_subscribe_fails_on_deactivated_plan() {
+    let (env, oracle, admin, feed) = setup_with_plan();
+    let user = Address::generate(&env);
+    oracle.deactivate_plan(&admin, &feed, &SubscriptionTier::Basic);
+    oracle.subscribe(&user, &feed, &SubscriptionTier::Basic, &false);
+}
+
+#[test]
+fn test_access_expires_after_period() {
+    let (env, oracle, _admin, feed) = setup_with_plan();
+    let user = Address::generate(&env);
+    oracle.subscribe(&user, &feed, &SubscriptionTier::Basic, &false);
+
+    let sub = oracle.get_subscription(&user, &feed).unwrap();
+    // Advance ledger past expiry
+    env.ledger().set_timestamp(sub.expires_at + 1);
+    assert!(!oracle.check_access(&user, &feed));
+}
