@@ -1,6 +1,6 @@
 extern crate alloc;
 use alloc::string::ToString;
-use soroban_sdk::{contracttype, Env, String, Symbol, Val, Vec, TryIntoVal, ConversionError, Address, format};
+use soroban_sdk::{contracttype, symbol_short, vec, Env, Symbol, Vec, Address, String, Val, TryIntoVal, ConversionError};
 
 use stellai_lib::{
     atomic::AtomicTransactionSupport,
@@ -252,7 +252,7 @@ impl MarketplaceAtomicSupport {
                 
                 if !success {
                     // Commit failed, trigger rollback
-                    Self::rollback_transaction(env, transaction_id, steps, executed_steps, &format!("Step {} commit failed", step.step_id));
+                    Self::rollback_transaction(env, transaction_id, steps, executed_steps, "Step commit failed");
                     return false;
                 }
                 
@@ -295,7 +295,7 @@ impl MarketplaceAtomicSupport {
         
         // Mark transaction as rolled back
         Self::update_transaction_state(env, transaction_id, TransactionStatus::RolledBack, Some(reason));
-        Self::create_atomic_audit_log(env, transaction_id, None, "transaction_rolled_back", true, Some(&format!("Rollback complete: {}", reason)));
+        Self::create_atomic_audit_log(env, transaction_id, None, "transaction_rolled_back", true, Some("Rollback complete"));
         
         env.events().publish(
             (Symbol::new(env, "atomic_tx_rolled_back"),),
@@ -356,7 +356,7 @@ impl AtomicTransactionSupport for MarketplaceAtomicSupport {
         
         // Log successful preparation
         let func_str = function.to_string();
-        let log_msg = String::from_str(env, &format!("Function: {} prepared successfully", func_str));
+        let log_msg = String::from_str(env, "Function prepared successfully");
         Self::create_atomic_audit_log(
             env, 
             transaction_id, 
@@ -414,7 +414,7 @@ impl AtomicTransactionSupport for MarketplaceAtomicSupport {
             
             // Log successful commit
             let func_str = function.to_string();
-            let log_msg = String::from_str(env, &format!("Function: {} executed successfully", func_str));
+            let log_msg = String::from_str(env, "Function executed successfully");
             Self::create_atomic_audit_log(
                 env,
                 transaction_id,
@@ -459,13 +459,15 @@ impl AtomicTransactionSupport for MarketplaceAtomicSupport {
         
         if let Some(mut state) = env.storage().instance().get::<_, AtomicStepState>(&step_key) {
             // Use the stored rollback contract if available, otherwise fall back to the main contract
-            let rollback_contract = state.rollback_contract.unwrap_or(state.contract.clone());
+            let rollback_contract = state.rollback_contract.clone().unwrap_or(state.contract.clone());
+            
+            let rb_function = rollback_function.clone();
+            let rb_args = rollback_args.clone();
             
             // Actually execute the rollback function
-            let rollback_result = env.try_invoke_contract::<Val, ConversionError>(&rollback_contract, rollback_function, rollback_args.clone())
+            let rollback_result = env.try_invoke_contract::<Val, ConversionError>(&rollback_contract, &rb_function, rb_args)
                 .map_or_else(|e| {
-                    let error_msg = format!("Rollback execution warning: {:?}", e);
-                    Self::create_atomic_audit_log(env, transaction_id, Some(step_id), "rollback_warning", false, Some(&error_msg));
+                    Self::create_atomic_audit_log(env, transaction_id, Some(step_id), "rollback_warning", false, Some("Rollback execution warning"));
                     false
                 }, |_| true);
 
@@ -484,7 +486,7 @@ impl AtomicTransactionSupport for MarketplaceAtomicSupport {
                 Some(step_id),
                 "step_rolled_back",
                 rollback_result,
-                Some(&format!("Rollback function: {} executed", rollback_function.to_string()))
+                Some("Rollback function executed")
             );
             
             true

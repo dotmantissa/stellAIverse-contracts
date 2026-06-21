@@ -28,6 +28,7 @@ pub struct OperatorData {
 }
 
 const AGENT_NFT_KEY: &str = "agent_nft";
+const MARKETPLACE_KEY: &str = "marketplace";
 
 // Rate limit configuration storage keys
 const GLOBAL_RATE_LIMIT_KEY: Symbol = symbol_short!("rate_gl");
@@ -252,6 +253,14 @@ impl ExecutionHub {
         env.storage().instance().get(&rule_key)
     }
 
+    pub fn set_marketplace(env: Env, admin: Address, marketplace: Address) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, MARKETPLACE_KEY), &marketplace);
+    }
+
     /// Execute action with validation, replay protection, and proof storage (Issue #10)
     ///
     /// # Arguments
@@ -277,9 +286,8 @@ impl ExecutionHub {
 
         Self::validate_agent_id(agent_id);
 
-        // Permission Check: re-validate owner/operator from storage (Issue #152)
-        // No implicit trust — rbac::require_owner_or_operator reads storage directly.
-        rbac::require_owner_or_operator(
+        // Permission Check: owner, operator, OR active lessee
+        let is_authorized = rbac::require_owner_or_operator(
             &env,
             &executor,
             agent_id,
@@ -296,7 +304,31 @@ impl ExecutionHub {
                     .map(|d| (d.operator, d.expires_at))
             },
         )
-        .unwrap_or_else(|_| panic!("Unauthorized: executor is not owner or operator"));
+        .is_ok();
+
+        if !is_authorized {
+            // Check for lease via Marketplace
+            if let Some(marketplace) = env
+                 .storage()
+                 .instance()
+                 .get::<_, Address>(&Symbol::new(&env, MARKETPLACE_KEY))
+            {
+                let has_lease: bool = env.invoke_contract(
+                     &marketplace,
+                     &Symbol::new(&env, "check_lease_permission"),
+                     soroban_sdk::vec![
+                         &env,
+                         agent_id.into_val(&env),
+                         executor.clone().into_val(&env),
+                     ],
+                 );
+                if !has_lease {
+                    panic!("Unauthorized: executor is not owner, operator, or active lessee");
+                }
+            } else {
+                panic!("Unauthorized: executor is not owner or operator (and no marketplace configured for lease check)");
+            }
+        }
         Self::validate_string_length(&action, "Action name");
         Self::validate_data_size(&parameters, "Parameters");
         Self::validate_data_size(&execution_hash, "Execution hash");
@@ -1368,7 +1400,7 @@ impl ExecutionHub {
 
             // Emit event
             env.events().publish(
-                (symbol_short!("batch_exec"),),
+                (Symbol::new(&env, "batch_exec"),),
                 (
                     execution_id,
                     op.agent_id,
@@ -1523,7 +1555,7 @@ impl ExecutionHub {
 
         // Emit event
         env.events().publish(
-            (symbol_short!("batch_exec"),),
+            (Symbol::new(&env, "batch_exec"),),
             (execution_id, agent_id, action.clone(), executor.clone()),
         );
 
@@ -2223,7 +2255,13 @@ mod test {
         let mut operations = Vec::new(&env);
 
         for i in 1..=3u32 {
-            let action = String::from_str(&env, &format!("action_{}", i));
+            let action_str = match i {
+                1 => "action_1",
+                2 => "action_2",
+                3 => "action_3",
+                _ => "action_0",
+            };
+            let action = String::from_str(&env, action_str);
             let params = Bytes::from_array(&env, &[i as u8]);
             let hash = Bytes::from_array(&env, &[i as u8, 0x00]);
 
@@ -2291,7 +2329,12 @@ mod test {
         let mut operations = Vec::new(&env);
 
         for i in 1..=2u32 {
-            let action = String::from_str(&env, &format!("action_{}", i));
+            let action_str = match i {
+                1 => "action_1",
+                2 => "action_2",
+                _ => "action_0",
+            };
+            let action = String::from_str(&env, action_str);
             let params = Bytes::from_array(&env, &[i as u8]);
             let hash = Bytes::from_array(&env, &[i as u8]);
 

@@ -1,5 +1,5 @@
 use crate::payment_types::PaymentRecord;
-use soroban_sdk::{contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
 
 /// Status of an escrow entry
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +72,9 @@ pub enum DataKey {
     LesseeLeases(Address, u64),
     LessorLeases(Address, u64),
     LeaseHistory(u64, u64),
+    LeaseNotificationCounter,
+    LeaseNotification(u64),
+    LeaseNotificationIndex(u64, u64), // (lease_id, history_index)
     EscrowConfig, // Auto-release period and other escrow settings
     EscrowCounter,
     Escrow(u64),                 // Individual escrow entry by ID
@@ -140,6 +143,11 @@ pub fn set_royalty_bps(env: &Env, bps: u32) {
 }
 
 #[allow(dead_code)]
+pub fn get_royalty(env: &Env, agent_id: u64) -> Option<stellai_lib::RoyaltyInfo> {
+    let royalty_key = (Symbol::new(env, "royalty"), agent_id);
+    env.storage().instance().get(&royalty_key)
+}
+
 pub fn get_royalty_bps(env: &Env) -> u32 {
     env.storage().instance().get(&DataKey::RoyaltyBps).unwrap()
 }
@@ -756,18 +764,16 @@ pub fn add_lease_history(env: &Env, lease_id: u64, history: &stellai_lib::LeaseH
     env.storage()
         .instance()
         .set(&DataKey::LeaseHistory(lease_id, history_index), history);
+    env.storage()
+        .instance()
+        .set(&(Symbol::new(env, "lhist_cnt"), lease_id), &(history_index + 1));
 }
 
 pub fn get_lease_history_count(env: &Env, lease_id: u64) -> u64 {
-    let mut count = 0;
-    while env
-        .storage()
+    env.storage()
         .instance()
-        .has(&DataKey::LeaseHistory(lease_id, count))
-    {
-        count += 1;
-    }
-    count
+        .get(&(Symbol::new(env, "lhist_cnt"), lease_id))
+        .unwrap_or(0)
 }
 
 pub fn get_lease_history(
@@ -778,6 +784,54 @@ pub fn get_lease_history(
     env.storage()
         .instance()
         .get(&DataKey::LeaseHistory(lease_id, index))
+}
+
+pub fn increment_lease_notification_counter(env: &Env) -> u64 {
+    let counter: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::LeaseNotificationCounter)
+        .unwrap_or(0);
+    let updated = counter + 1;
+    env.storage()
+        .instance()
+        .set(&DataKey::LeaseNotificationCounter, &updated);
+    updated
+}
+
+pub fn set_lease_notification(env: &Env, notification: &stellai_lib::LeaseNotification) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LeaseNotification(notification.notification_id), notification);
+}
+
+pub fn add_lease_notification_index(env: &Env, lease_id: u64, notification_id: u64) {
+    let index = get_lease_notification_count(env, lease_id);
+    env.storage()
+        .instance()
+        .set(&DataKey::LeaseNotificationIndex(lease_id, index), &notification_id);
+    env.storage()
+        .instance()
+        .set(&(Symbol::new(env, "lnot_cnt"), lease_id), &(index + 1));
+}
+
+pub fn get_lease_notification(env: &Env, notification_id: u64) -> Option<stellai_lib::LeaseNotification> {
+    env.storage()
+        .instance()
+        .get(&DataKey::LeaseNotification(notification_id))
+}
+
+pub fn get_lease_notification_count(env: &Env, lease_id: u64) -> u64 {
+    env.storage()
+        .instance()
+        .get(&(Symbol::new(env, "lnot_cnt"), lease_id))
+        .unwrap_or(0)
+}
+
+pub fn get_lease_notification_index(env: &Env, lease_id: u64, index: u64) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::LeaseNotificationIndex(lease_id, index))
 }
 
 /* ---------------- ESCROW ---------------- */

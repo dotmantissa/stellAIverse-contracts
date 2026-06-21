@@ -1,17 +1,17 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::Marketplace;
-    use soroban_sdk::{contract, contractimpl, testutils::{self, Address as _, Events as _}, Address, BytesN, Env, Symbol, Vec};
+    use crate::{storage, Marketplace};
+    use soroban_sdk::{testutils::{Address as _, Events as _}, Address, Env, String};
 
     #[test]
     fn test_dynamic_fee_adjustment_enhancement() {
         let env = Env::default();
         let admin = Address::generate(&env);
         let oracle_id = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(admin.clone());
 
         // Initialize marketplace with dynamic fee adjustment
-        Marketplace::init_contract(env.clone(), admin.clone());
+        Marketplace::initialize(env.clone(), admin.clone(), token_address, 250);
 
         // Initialize fee adjustment with enhanced parameters
         Marketplace::init_fee_adjustment(
@@ -95,8 +95,9 @@ mod tests {
     fn test_fee_transition_system() {
         let env = Env::default();
         let admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(admin.clone());
 
-        Marketplace::init_contract(env.clone(), admin.clone());
+        Marketplace::initialize(env.clone(), admin.clone(), token_address, 250);
 
         // Test transition state
         let transition_state = storage::FeeTransitionState {
@@ -142,8 +143,9 @@ mod tests {
     fn test_fee_adjustment_history() {
         let env = Env::default();
         let admin = Address::generate(&env);
+        let token_address = env.register_stellar_asset_contract(admin.clone());
 
-        Marketplace::init_contract(env.clone(), admin.clone());
+        Marketplace::initialize(env.clone(), admin.clone(), token_address, 250);
 
         // Create a fee adjustment history entry
         let history = storage::FeeAdjustmentHistory {

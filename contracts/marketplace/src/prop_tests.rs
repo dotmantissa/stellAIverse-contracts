@@ -19,8 +19,9 @@ mod prop_tests {
         let id = env.register_contract(None, Marketplace);
         let client = MarketplaceClient::new(env, &id);
         let admin = Address::generate(env);
+        let token_address = env.register_stellar_asset_contract(admin.clone());
         env.mock_all_auths();
-        client.init_contract(&admin);
+        client.initialize(&admin, &token_address, &250);
         (client, admin)
     }
 

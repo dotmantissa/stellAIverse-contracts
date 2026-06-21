@@ -154,13 +154,13 @@ pub fn calculate_and_distribute_royalties(
         return Err("Sale price below minimum royalty threshold");
     }
 
-    // Get agent-specific royalty configuration if exists
+    // Use agent-specific royalty configuration if exists
     let royalty_config = storage::get_royalty_config(env, agent_id);
 
     // Determine royalty recipients and rates
-    let recipients = if let Some(config) = royalty_config {
+    let recipients = if let Some(config) = &royalty_config {
         // Use agent-specific configuration
-        config.recipients
+        config.recipients.clone()
     } else {
         // Use default single recipient (creator from legacy RoyaltyInfo)
         let legacy_royalty = storage::get_royalty(env, agent_id);
@@ -174,15 +174,15 @@ pub fn calculate_and_distribute_royalties(
             default_recipients
         } else {
             // Use asset class default
-            let mut default_recipients = Vec::new(env);
-            // Note: In a real implementation, you'd need to get the creator address
-            // For now, we'll skip royalties if no config exists
             return Err("No royalty configuration found");
         }
     };
 
     // Calculate total royalty amount
-    let total_royalty_bps: u32 = recipients.iter().map(|r| r.share_bps).sum();
+    let mut total_royalty_bps: u32 = 0;
+    for i in 0..recipients.len() {
+        total_royalty_bps += recipients.get(i).unwrap().share_bps;
+    }
     let total_royalty = (sale_price * (total_royalty_bps as i128)) / 10_000;
 
     // Apply maximum cap if configured
@@ -198,17 +198,15 @@ pub fn calculate_and_distribute_royalties(
 
     // Calculate individual shares
     let mut payment_recipients = Vec::new(env);
-    let mut royalty_amounts = Vec::new(env);
 
     for i in 0..recipients.len() {
         let recipient = recipients.get(i).unwrap();
-        let share_amount = (final_royalty * (recipient.share_bps as i128)) / total_royalty_bps;
+        let share_amount = (final_royalty * (recipient.share_bps as i128)) / (total_royalty_bps as i128);
         payment_recipients.push_back((
             recipient.recipient.clone(),
             share_amount,
             recipient.role.clone(),
         ));
-        royalty_amounts.push_back(share_amount);
     }
 
     // Execute token transfers
@@ -217,11 +215,11 @@ pub fn calculate_and_distribute_royalties(
 
     for i in 0..payment_recipients.len() {
         let (recipient, amount, _role) = payment_recipients.get(i).unwrap();
-        if *amount > 0 {
+        if amount > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
-                recipient,
-                amount,
+                &recipient,
+                &amount,
             );
         }
     }
@@ -329,6 +327,7 @@ mod tests {
             seller,
             platform_address,
             royalty_recipients,
+            asset_class: AssetClass::Agent,
         }
     }
 
@@ -403,6 +402,12 @@ mod tests {
         let seller = Address::generate(&env);
 
         env.as_contract(&contract_id, || {
+            let token_admin = Address::generate(&env);
+            let payment_token = env.register_stellar_asset_contract(token_admin.clone());
+            let token_admin_client = token::StellarAssetClient::new(&env, &payment_token);
+            storage::set_payment_token(&env, payment_token.clone());
+            token_admin_client.mint(&env.current_contract_address(), &2_000);
+
             let context = build_context(
                 &env,
                 seller.clone(),

@@ -1,6 +1,8 @@
 #![no_std]
 pub mod types;
 pub mod atomic;
+pub mod payment_types;
+pub mod payments;
 
 #[cfg(test)]
 mod prop_tests;
@@ -9,15 +11,21 @@ mod storage;
 mod test_bid_history;
 #[cfg(test)]
 mod test_dynamic_fee_enhancement;
+#[cfg(test)]
+mod test_advanced_lease;
+#[cfg(test)]
+mod test_lease;
 
+use crate::types::{MarketplaceCircuitBreaker, PricingRule};
 use payment_types::PaymentRecord;
 use payments::{
     calculate_and_distribute_royalties, calculate_splits, execute_payment_routing,
     PaymentRoutingContext, validate_royalty_config,
 };
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, token, Address, Bytes, BytesN, Env, IntoVal, Map, String, Symbol,
-    TryIntoVal, Val, Vec,
+    TryIntoVal, Val, Vec, symbol_short, vec,
 };
 use stellai_lib::{
     audit::{create_audit_log, OperationType},
@@ -27,7 +35,11 @@ use stellai_lib::{
     types::{
         Approval, ApprovalConfig, ApprovalHistory, ApprovalStatus, Auction, AuctionStatus,
         AuctionType, BidRecord, LeaseData, LeaseExtensionRequest, LeaseHistoryEntry, LeaseState,
-        Listing, ListingType, RoyaltyInfo, TransactionStep, TransactionStatus,
+        LeaseNotification, LeaseNotificationChannel, Listing, ListingType, RoyaltyInfo,
+        TransactionStep, TransactionStatus, PaymentFrequency, LateFeeType, LateFeePolicy,
+        RenewalPolicy,
+        AssetClass, RoyaltyRecipient, RoyaltyConfig, RoyaltyPaymentRecord,
+        OracleData, AssetClassRoyaltySettings,
     },
     validation,
 };
@@ -35,6 +47,9 @@ use storage::{Escrow, EscrowConfig, EscrowStatus, *};
 
 #[contract]
 pub struct MarketplaceContract;
+
+pub use MarketplaceContract as Marketplace;
+pub use MarketplaceContractClient as MarketplaceClient;
 
 const DATA_EXPIRATION_WINDOW_SECONDS: u64 = 3600; 
 const BPS_DENOMINATOR: u128 = 10_000;
@@ -49,7 +64,7 @@ impl MarketplaceContract {
         
         admin.require_auth();
         set_admin(&env, &admin);
-        set_payment_token(&env, payment_token);
+        set_payment_token(&env, payment_token.clone());
         set_platform_fee(&env, platform_fee_bps);
         
         // Initialize atomic transaction support
@@ -63,7 +78,7 @@ impl MarketplaceContract {
         env.storage().instance().set(&Symbol::new(&env, "oracle"), &oracle);
     }
 
-    pub fn set_circuit_breaker(env: Env, admin: Address, status: MarketplaceCircuitBreaker) {
+    pub fn set_circuit_breaker(env: Env, admin: Address, status: MarketplaceCircuitBreaker, fee_bps: u32) {
         admin.require_auth();
         assert!(fee_bps <= 5000, "Platform fee cannot exceed 50%");
         Self::verify_admin(&env, &admin);
@@ -77,15 +92,30 @@ impl MarketplaceContract {
         storage::get_platform_fee(&env)
     }
 
+    /// Update the payment token used by the marketplace.
+    pub fn set_payment_token(env: Env, admin: Address, payment_token: Address) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+        storage::set_payment_token(&env, payment_token.clone());
+        env.events().publish(
+            (Symbol::new(&env, "payment_token_updated"),),
+            (payment_token,),
+        );
+    }
+
+    /// Update the platform fee directly.
+    pub fn set_platform_fee(env: Env, admin: Address, fee_bps: u32) {
+        admin.require_auth();
+        Self::verify_admin(&env, &admin);
+        assert!(fee_bps <= 5000, "Platform fee cannot exceed 50%");
+        storage::set_platform_fee(&env, fee_bps);
+        env.events()
+            .publish((Symbol::new(&env, "platform_fee_updated"),), (fee_bps,));
+    }
+
     /// Atomic transaction support functions
     pub fn get_next_atomic_transaction_id(env: Env) -> u64 {
         crate::atomic::MarketplaceAtomicSupport::get_next_transaction_id(&env)
-    }
-
-    pub fn execute_atomic_transaction(env: Env, initiator: Address, steps: Vec<TransactionStep>) -> bool {
-        initiator.require_auth();
-        let transaction_id = Self::get_next_atomic_transaction_id(env.clone());
-        crate::atomic::MarketplaceAtomicSupport::execute_atomic_transaction(&env, transaction_id, &steps)
     }
 
     pub fn try_execute_atomic_transaction(env: Env, initiator: Address, steps: Vec<TransactionStep>) -> bool {
@@ -102,6 +132,27 @@ impl MarketplaceContract {
     pub fn get_atomic_step_state(env: Env, transaction_id: u64, step_id: u32) -> Option<crate::atomic::AtomicStepState> {
         let step_key = (Symbol::new(&env, "atomic_step"), transaction_id, step_id);
         env.storage().instance().get(&step_key)
+    }
+
+    /// Check if a user has a valid active lease for an agent.
+    pub fn check_lease_permission(env: Env, agent_id: u64, user: Address) -> bool {
+        // Find if there is an active lease for this agent and user
+        // In a real production system, we'd have an index for agent -> active_lease
+        // For now, we'll iterate through user's leases as a fallback if no direct index exists
+        let lessee_count = storage::get_lessee_lease_count(&env, &user);
+        for i in 0..lessee_count {
+            if let Some(lease_id) = storage::get_lessee_lease(&env, &user, i) {
+                if let Some(lease) = storage::get_lease(&env, lease_id) {
+                    if lease.agent_id == agent_id && Self::is_live_lease_state(lease.status) {
+                        let now = env.ledger().timestamp();
+                        if now >= lease.start_time && now < lease.end_time {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Internal: verify caller is the stored admin — always re-reads from storage (Issue #152)
@@ -209,6 +260,10 @@ impl MarketplaceContract {
 
         if !listing.active {
             panic!("Listing is not active");
+        }
+
+        if listing.listing_type != ListingType::Sale {
+            panic!("Listing is not for sale. Use initiate_lease() for leases or bid() for auctions.");
         }
 
         if listing.price >= approval_config.threshold {
@@ -480,7 +535,7 @@ impl MarketplaceContract {
         admin.require_auth();
         Self::verify_admin(&env, &admin);
 
-        let settings = AssetClassRoyaltySettings {
+        let settings = stellai_lib::types::AssetClassRoyaltySettings {
             asset_class,
             default_royalty_bps,
             min_royalty_bps,
@@ -500,7 +555,7 @@ impl MarketplaceContract {
     pub fn get_asset_class_royalty_settings(
         env: Env,
         asset_class: AssetClass,
-    ) -> AssetClassRoyaltySettings {
+    ) -> stellai_lib::types::AssetClassRoyaltySettings {
         storage::get_asset_class_royalty_settings(&env, asset_class)
             .unwrap_or_else(|| storage::get_default_asset_class_settings(&env, asset_class))
     }
@@ -1066,7 +1121,7 @@ impl MarketplaceContract {
             .unwrap_or_else(|| panic!("Oracle reference not configured"));
 
         let mut check_payload = Bytes::new(&env);
-        check_payload.append(&oracle_data.metric_id.to_xdr(&env));
+        check_payload.append(&oracle_data.key.to_xdr(&env));
         check_payload.append(&oracle_data.value.to_xdr(&env));
         check_payload.append(&oracle_data.timestamp.to_xdr(&env));
 
@@ -1078,7 +1133,7 @@ impl MarketplaceContract {
             panic!("Oracle data attestation has expired");
         }
 
-        oracle_data.value
+        oracle_data.value.try_into().unwrap()
     }
 
     pub fn calculate_dynamic_price(
@@ -1097,85 +1152,98 @@ impl MarketplaceContract {
         if rule.inverse {
             rule.base_price.checked_sub(adjustment).unwrap_or(0)
         } else {
-            1000
-        };
-        let min_bid = if auction.highest_bid > 0 {
-            auction.highest_bid + computed_min_step
-        } else {
-            // No bids yet: require at least the start price (or start price + min step)
-            let baseline = auction.start_price;
-            if baseline > computed_min_step {
-                baseline
-            } else {
-                computed_min_step
-            }
-        };
-
-        assert!(amount >= min_bid, "Bid too low");
-
-        let token_client = token::Client::new(&env, &get_payment_token(&env));
-
-        // Refund previous highest bidder
-        if let Some(prev_bidder) = auction.highest_bidder {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &prev_bidder,
-                &auction.highest_bid,
-            );
+            rule.base_price.checked_add(adjustment).unwrap_or(u128::MAX)
         }
+    }
 
-        // Lock new bid in contract
-        token_client.transfer(&bidder, &env.current_contract_address(), &amount);
-
-        // Capture previous bid before overwriting for increment calculation
-        let prev_highest = auction.highest_bid;
-        let bid_increment = amount - prev_highest;
-
-        auction.highest_bidder = Some(bidder.clone());
-        auction.highest_bid = amount;
-
-        // Extend auction by 5 minutes if bid in final 5 minutes
-        let time_left = auction.end_time - env.ledger().timestamp();
-        if time_left < 300 {
-            auction.end_time += 300;
-        }
-
-        set_auction(&env, &auction);
-
-        // Record bid in history with sequence and increment
-        let sequence = get_bid_history_count(&env, auction_id) + 1;
-        add_bid_history(
-            &env,
-            auction_id,
-            &BidRecord {
-                bidder: bidder.clone(),
-                amount,
-                timestamp: env.ledger().timestamp(),
-                bid_increment,
-                sequence,
-            },
+    /// Place a bid in an English auction
+    pub fn place_bid(env: Env, auction_id: u64, bidder: Address, amount: i128) {
+        bidder.require_auth();
+        let mut auction = get_auction(&env, auction_id).expect("Auction not found");
+        assert!(auction.status == AuctionStatus::Active, "Auction not active");
+        assert!(
+            env.ledger().timestamp() < auction.end_time,
+            "Auction has ended"
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "BidPlaced"),),
-            (auction_id, bidder.clone(), amount, auction.end_time),
-        );
+        let computed_min_step = (auction.start_price * (auction.min_bid_increment_bps as i128)) / 10_000;
+         let min_bid = if auction.highest_bid > 0 {
+             auction.highest_bid + computed_min_step
+         } else {
+             // No bids yet: require at least the start price (or start price + min step)
+             let baseline = auction.start_price;
+             if baseline > computed_min_step {
+                 baseline
+             } else {
+                 computed_min_step
+             }
+         };
 
-        // Audit log for bid placement
-        let before_state = String::from_str(&env, "{\"bid_placed\":false}");
-        let after_state = String::from_str(&env, "{\"bid_placed\":true}");
-        let tx_hash = String::from_str(&env, "place_bid");
-        let description = Some(String::from_str(&env, "Auction bid placed"));
+         assert!(amount >= min_bid, "Bid too low");
 
-        let _ = create_audit_log(
-            &env,
-            bidder,
-            OperationType::AuctionBidPlaced,
-            before_state,
-            after_state,
-            tx_hash,
-            description,
-        );
+         let token_client = token::Client::new(&env, &get_payment_token(&env));
+
+         // Refund previous highest bidder
+         if let Some(prev_bidder) = auction.highest_bidder {
+             token_client.transfer(
+                 &env.current_contract_address(),
+                 &prev_bidder,
+                 &auction.highest_bid,
+             );
+         }
+
+         // Lock new bid in contract
+         token_client.transfer(&bidder, &env.current_contract_address(), &amount);
+
+         // Capture previous bid before overwriting for increment calculation
+         let prev_highest = auction.highest_bid;
+         let bid_increment = amount - prev_highest;
+
+         auction.highest_bidder = Some(bidder.clone());
+         auction.highest_bid = amount;
+
+         // Extend auction by 5 minutes if bid in final 5 minutes
+         let time_left = auction.end_time - env.ledger().timestamp();
+         if time_left < 300 {
+             auction.end_time += 300;
+         }
+
+         set_auction(&env, &auction);
+
+         // Record bid in history with sequence and increment
+         let sequence = get_bid_history_count(&env, auction_id) + 1;
+         add_bid_history(
+             &env,
+             auction_id,
+             &BidRecord {
+                 bidder: bidder.clone(),
+                 amount,
+                 timestamp: env.ledger().timestamp(),
+                 bid_increment,
+                 sequence,
+             },
+         );
+
+         env.events().publish(
+             (Symbol::new(&env, "BidPlaced"),),
+             (auction_id, bidder.clone(), amount, auction.end_time),
+         );
+
+         // Audit log for bid placement
+         let before_state = String::from_str(&env, "{\"bid_placed\":false}");
+         let after_state = String::from_str(&env, "{\"bid_placed\":true}");
+         let tx_hash = String::from_str(&env, "place_bid");
+         let description = Some(String::from_str(&env, "Auction bid placed"));
+
+         let _ = create_audit_log(
+             &env,
+             bidder.clone(),
+             OperationType::AuctionBidPlaced,
+             before_state,
+             after_state,
+             tx_hash,
+             description,
+         );
     }
 
     /// Returns the number of bids placed in an auction.
@@ -1198,6 +1266,52 @@ impl MarketplaceContract {
     /// Returns a single bid history entry by its 0-based index.
     pub fn get_bid_history_entry_at(env: Env, auction_id: u64, index: u64) -> Option<BidRecord> {
         get_bid_history_entry(&env, auction_id, index)
+    }
+
+    /// Create a standard English or Dutch auction.
+    pub fn create_auction(
+        env: Env,
+        agent_id: u64,
+        seller: Address,
+        auction_type: AuctionType,
+        start_price: i128,
+        reserve_price: i128,
+        duration_seconds: u64,
+        min_bid_increment_bps: u32,
+    ) -> u64 {
+        seller.require_auth();
+        assert!(start_price > 0, "Invalid start price");
+        assert!(reserve_price >= 0, "Invalid reserve price");
+        assert!(duration_seconds > 0, "Invalid duration");
+
+        let auction_id = increment_auction_counter(&env);
+        let start_time = env.ledger().timestamp();
+        let end_time = start_time + duration_seconds;
+        let auction = Auction {
+            auction_id,
+            agent_id,
+            seller: seller.clone(),
+            auction_type,
+            start_price,
+            reserve_price,
+            current_price: start_price,
+            highest_bidder: None,
+            highest_bid: 0,
+            start_time,
+            end_time,
+            min_bid_increment_bps,
+            status: AuctionStatus::Active,
+            dutch_config: None,
+            sealed_commit_end: None,
+            sealed_reveal_end: None,
+        };
+
+        set_auction(&env, &auction);
+        env.events().publish(
+            (Symbol::new(&env, "AuctionCreated"),),
+            (auction_id, agent_id, auction_type, start_price),
+        );
+        auction_id
     }
 
     /// Create a sealed-bid auction with explicit commit/reveal durations
@@ -1379,7 +1493,7 @@ impl MarketplaceContract {
             "Not a Dutch auction"
         );
 
-        let current_price = Self::calculate_dutch_price(env.clone(), auction_id);
+        let current_price = Self::calculate_dutch_price(env.clone(), &auction);
 
         let token_client = token::Client::new(&env, &get_payment_token(&env));
         token_client.transfer(&buyer, &env.current_contract_address(), &current_price);
@@ -1389,7 +1503,7 @@ impl MarketplaceContract {
 
         set_auction(&env, &auction);
 
-        Marketplace::resolve_auction(env, auction_id);
+        Self::resolve_auction(env, auction_id);
     }
 
     pub fn resolve_auction(env: Env, auction_id: u64) {
@@ -1422,7 +1536,7 @@ impl MarketplaceContract {
                 Self::process_fee_transition(env.clone());
 
                 let platform_fee_bps = Self::get_platform_fee(env.clone());
-                let royalty_info = Marketplace::get_royalty(env.clone(), auction.agent_id);
+                let royalty_info = Self::get_royalty(env.clone(), auction.agent_id);
                 // For sealed auctions, collect deposits and refund non-winners
                 let token_client = token::Client::new(&env, &get_payment_token(&env));
 
@@ -2144,7 +2258,7 @@ impl MarketplaceContract {
 
         // Release funds to seller by routing payment
         let platform_fee_bps = Self::get_platform_fee(env.clone());
-        let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
+        let royalty_info = Self::get_royalty(env.clone(), escrow.agent_id);
 
         Self::route_sale_payment(
             &env,
@@ -2213,7 +2327,7 @@ impl MarketplaceContract {
         if release_to_seller {
             // Release funds to seller
             let platform_fee_bps = Self::get_platform_fee(env.clone());
-            let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
+            let royalty_info = Self::get_royalty(env.clone(), escrow.agent_id);
 
             Self::route_sale_payment(
                 &env,
@@ -2256,7 +2370,7 @@ impl MarketplaceContract {
             if escrow.status == EscrowStatus::Held && now >= escrow.auto_release_at {
                 // Auto-release funds to seller
                 let platform_fee_bps = Self::get_platform_fee(env.clone());
-                let royalty_info = Marketplace::get_royalty(env.clone(), escrow.agent_id);
+                let royalty_info = Self::get_royalty(env.clone(), escrow.agent_id);
 
                 Self::route_sale_payment(
                     &env,
@@ -2372,7 +2486,7 @@ impl MarketplaceContract {
         storage::get_lease_config(&env)
     }
 
-    /// Initiate a lease for an agent
+    /// Initiate a lease for an agent using the default financial settings.
     pub fn initiate_lease(
         env: Env,
         listing_id: u64,
@@ -2381,76 +2495,22 @@ impl MarketplaceContract {
         auto_renew: bool,
         lessee_consent_for_renewal: bool,
     ) -> u64 {
-        lessee.require_auth();
-
-        if validation::validate_nonzero_id(listing_id).is_err() {
-            panic!("Invalid listing ID");
-        }
-        if duration_seconds == 0 {
-            panic!("Duration must be positive");
-        }
-        if duration_seconds > stellai_lib::MAX_DURATION_DAYS * 24 * 60 * 60 {
-            panic!("Duration exceeds maximum");
-        }
-
-        let listing_key = (Symbol::new(&env, "listing"), listing_id);
-        let listing: Listing = env
-            .storage()
-            .instance()
-            .get(&listing_key)
-            .expect("Listing not found");
-
-        if !listing.active {
-            panic!("Listing is not active");
-        }
-        if listing.listing_type != ListingType::Lease {
-            panic!("Listing is not for lease");
-        }
-
-        let lease_id = storage::increment_lease_counter(&env);
-        let now = env.ledger().timestamp();
-        let end_time = now + duration_seconds;
-
         let config = storage::get_lease_config(&env);
-        let deposit_amount = (listing.price * (config.deposit_bps as i128)) / 10_000;
-
-        let lease = LeaseData {
-            lease_id,
-            agent_id: listing.agent_id,
+        Self::initiate_lease_v2(
+            env,
             listing_id,
-            lessor: listing.seller.clone(),
-            lessee: lessee.clone(),
-            start_time: now,
-            end_time,
+            lessee,
             duration_seconds,
-            deposit_amount,
-            total_value: listing.price,
             auto_renew,
             lessee_consent_for_renewal,
-            status: LeaseState::Active,
-            pending_extension_id: None,
-        };
-
-        storage::set_lease(&env, &lease);
-        storage::lessee_leases_append(&env, &lessee, lease_id);
-        storage::lessor_leases_append(&env, &listing.seller, lease_id);
-
-        // Add to history
-        let entry = LeaseHistoryEntry {
-            lease_id,
-            action: String::from_str(&env, "initiated"),
-            actor: lessee.clone(),
-            timestamp: now,
-            details: None,
-        };
-        storage::add_lease_history(&env, lease_id, &entry);
-
-        env.events().publish(
-            (Symbol::new(&env, "LeaseInitiated"),),
-            (lease_id, listing_id, lessee, duration_seconds, auto_renew),
-        );
-
-        lease_id
+            PaymentFrequency::Monthly,
+            0,
+            config.early_termination_penalty_bps,
+            LateFeePolicy {
+                fee_type: LateFeeType::None,
+                value: 0,
+            },
+        )
     }
 
     /// Request lease extension
@@ -2474,7 +2534,7 @@ impl MarketplaceContract {
         if lease.lessee != lessee {
             panic!("Unauthorized: only lessee can request extension");
         }
-        if lease.status != LeaseState::Active {
+        if !Self::is_live_lease_state(lease.status) {
             panic!("Lease is not active");
         }
         if lease.pending_extension_id.is_some() {
@@ -2494,23 +2554,28 @@ impl MarketplaceContract {
 
         storage::set_lease_extension(&env, &extension);
 
-        lease.status = LeaseState::ExtensionRequested;
+        let old_status = lease.status;
         lease.pending_extension_id = Some(extension_id);
+        Self::transition_lease_state(
+            &env,
+            &mut lease,
+            LeaseState::ExtensionRequested,
+            &lessee,
+            "extension_requested",
+            Some(String::from_str(&env, "Lessee requested more time on the lease")),
+            Some(String::from_str(&env, "extension_request_created")),
+        );
         storage::set_lease(&env, &lease);
-
-        // Add to history
-        let entry = LeaseHistoryEntry {
-            lease_id,
-            action: String::from_str(&env, "extension_requested"),
-            actor: lessee.clone(),
-            timestamp: now,
-            details: Some(String::from_str(&env, "additional_duration: 3600")),
-        };
-        storage::add_lease_history(&env, lease_id, &entry);
 
         env.events().publish(
             (Symbol::new(&env, "LeaseExtensionRequested"),),
-            (lease_id, extension_id, lessee, additional_duration_seconds),
+            (
+                lease_id,
+                extension_id,
+                lessee,
+                additional_duration_seconds,
+                old_status,
+            ),
         );
 
         extension_id
@@ -2544,11 +2609,19 @@ impl MarketplaceContract {
             panic!("Extension already approved");
         }
 
-        // Update lease with extension
+        let old_status = lease.status;
         lease.end_time += extension.additional_duration_seconds;
         lease.duration_seconds += extension.additional_duration_seconds;
-        lease.status = LeaseState::Active;
         lease.pending_extension_id = None;
+        Self::transition_lease_state(
+            &env,
+            &mut lease,
+            LeaseState::Active,
+            &lessor,
+            "extension_approved",
+            Some(String::from_str(&env, "Lessor approved the extension request")),
+            Some(String::from_str(&env, "extension_approved")),
+        );
 
         storage::set_lease(&env, &lease);
 
@@ -2557,16 +2630,6 @@ impl MarketplaceContract {
         approved_extension.approved = true;
         storage::set_lease_extension(&env, &approved_extension);
 
-        // Add to history
-        let entry = LeaseHistoryEntry {
-            lease_id,
-            action: String::from_str(&env, "extension_approved"),
-            actor: lessor.clone(),
-            timestamp: env.ledger().timestamp(),
-            details: Some(String::from_str(&env, "additional_duration: 3600")),
-        };
-        storage::add_lease_history(&env, lease_id, &entry);
-
         env.events().publish(
             (Symbol::new(&env, "LeaseExtended"),),
             (
@@ -2574,6 +2637,7 @@ impl MarketplaceContract {
                 extension_id,
                 lessor,
                 extension.additional_duration_seconds,
+                old_status,
             ),
         );
     }
@@ -2590,15 +2654,15 @@ impl MarketplaceContract {
         }
 
         let mut lease = storage::get_lease(&env, lease_id).expect("Lease not found");
-
         if lease.lessee != lessee {
             panic!("Unauthorized: only lessee can terminate");
         }
-        if lease.status != LeaseState::Active {
+        if !Self::is_live_lease_state(lease.status) {
             panic!("Lease is not active");
         }
 
         let now = env.ledger().timestamp();
+        Self::sync_due_payments(&env, &mut lease);
         let remaining_time = if lease.end_time > now {
             lease.end_time - now
         } else {
@@ -2608,86 +2672,90 @@ impl MarketplaceContract {
             (lease.total_value * remaining_time as i128) / lease.duration_seconds as i128;
 
         let config = storage::get_lease_config(&env);
-        let required_penalty =
-            (remaining_value * (config.early_termination_penalty_bps as i128)) / 10_000;
+        let penalty_bps = if lease.termination_penalty_bps > 0 {
+            lease.termination_penalty_bps
+        } else {
+            config.early_termination_penalty_bps
+        };
+        let required_penalty = (remaining_value * (penalty_bps as i128)) / 10_000;
+        let required_settlement = lease.outstanding_balance + required_penalty;
+        let deposit_credit = if lease.deposit_amount > required_settlement {
+            required_settlement
+        } else {
+            lease.deposit_amount
+        };
+        let amount_due_from_lessee = required_settlement - deposit_credit;
 
-        if termination_fee_paid < required_penalty {
+        if termination_fee_paid < amount_due_from_lessee {
             panic!("Insufficient termination fee");
         }
 
-        lease.status = LeaseState::Terminated;
-        storage::set_lease(&env, &lease);
-
-        // Process termination fee payment to lessor
         let token_address = storage::get_payment_token(&env);
         let token_client = token::Client::new(&env, &token_address);
-        token_client.transfer(&lessee, &lease.lessor, &termination_fee_paid);
-
-        // Refund deposit if any
-        if lease.deposit_amount > 0 {
+        if amount_due_from_lessee > 0 {
             token_client.transfer(
-                &env.current_contract_address(),
                 &lessee,
-                &lease.deposit_amount,
+                &env.current_contract_address(),
+                &amount_due_from_lessee,
             );
         }
 
-        // Add to history
-        let entry = LeaseHistoryEntry {
-            lease_id,
-            action: String::from_str(&env, "early_terminated"),
-            actor: lessee.clone(),
-            timestamp: now,
-            details: Some(String::from_str(&env, "fee_paid: 1000, penalty: 2000")),
-        };
-        storage::add_lease_history(&env, lease_id, &entry);
+        let routed_amount = deposit_credit + amount_due_from_lessee;
+        if routed_amount > 0 {
+            let platform_fee_bps = Self::get_platform_fee(env.clone());
+            let royalty_info = Self::get_royalty(env.clone(), lease.agent_id);
+            Self::route_sale_payment(
+                &env,
+                lease.agent_id,
+                routed_amount,
+                &lease.lessee,
+                &lease.lessor,
+                royalty_info,
+                platform_fee_bps,
+                lease.asset_class,
+            );
+        }
+
+        if termination_fee_paid > amount_due_from_lessee {
+            let excess = termination_fee_paid - amount_due_from_lessee;
+            token_client.transfer(&env.current_contract_address(), &lessee, &excess);
+        }
+
+        let remaining_deposit = lease.deposit_amount - deposit_credit;
+        if remaining_deposit > 0 {
+            token_client.transfer(&env.current_contract_address(), &lessee, &remaining_deposit);
+        }
+
+        lease.deposit_amount = 0;
+        lease.outstanding_balance = 0;
+        lease.accrued_late_fees = 0;
+        lease.end_time = now;
+        Self::transition_lease_state(
+            &env,
+            &mut lease,
+            LeaseState::Terminated,
+            &lessee,
+            "early_terminated",
+            Some(String::from_str(&env, "Lease terminated before scheduled expiry")),
+            Some(String::from_str(&env, "termination_reconciliation_complete")),
+        );
+        storage::set_lease(&env, &lease);
 
         env.events().publish(
             (Symbol::new(&env, "LeaseTerminated"),),
-            (lease_id, lessee, termination_fee_paid, required_penalty),
+            (
+                lease_id,
+                lessee,
+                termination_fee_paid,
+                required_penalty,
+                required_settlement,
+            ),
         );
     }
 
     /// Automatic lease renewal
     pub fn auto_renew_lease(env: Env, lease_id: u64) {
-        let mut lease = storage::get_lease(&env, lease_id).expect("Lease not found");
-
-        if lease.status != LeaseState::Active {
-            panic!("Lease is not active");
-        }
-        if !lease.auto_renew {
-            panic!("Auto-renewal not enabled");
-        }
-        if !lease.lessee_consent_for_renewal {
-            panic!("Lessee consent not provided");
-        }
-
-        let now = env.ledger().timestamp();
-        if now < lease.end_time {
-            panic!("Lease not yet expired");
-        }
-
-        // Renew lease for same duration
-        lease.start_time = now;
-        lease.end_time = now + lease.duration_seconds;
-        lease.status = LeaseState::Renewed;
-
-        storage::set_lease(&env, &lease);
-
-        // Add to history
-        let entry = LeaseHistoryEntry {
-            lease_id,
-            action: String::from_str(&env, "auto_renewed"),
-            actor: env.current_contract_address(),
-            timestamp: now,
-            details: Some(String::from_str(&env, "new_duration: 86400")),
-        };
-        storage::add_lease_history(&env, lease_id, &entry);
-
-        env.events().publish(
-            (Symbol::new(&env, "LeaseRenewed"),),
-            (lease_id, lease.duration_seconds),
-        );
+        Self::auto_renew_lease_v2(env, lease_id);
     }
 
     /// Get lease by ID
@@ -2707,7 +2775,7 @@ impl MarketplaceContract {
         for i in 0..lessee_count {
             if let Some(lease_id) = storage::get_lessee_lease(&env, &user, i) {
                 if let Some(lease) = storage::get_lease(&env, lease_id) {
-                    if lease.status == LeaseState::Active {
+                    if Self::is_live_lease_state(lease.status) {
                         active_leases.push_back(lease);
                     }
                 }
@@ -2719,7 +2787,7 @@ impl MarketplaceContract {
         for i in 0..lessor_count {
             if let Some(lease_id) = storage::get_lessor_lease(&env, &user, i) {
                 if let Some(lease) = storage::get_lease(&env, lease_id) {
-                    if lease.status == LeaseState::Active {
+                    if Self::is_live_lease_state(lease.status) {
                         let mut found = false;
                         for existing in active_leases.iter() {
                             if existing.lease_id == lease.lease_id {
@@ -2754,6 +2822,24 @@ impl MarketplaceContract {
         }
 
         history
+    }
+
+    /// Get queued lease notifications for off-chain email delivery and in-app alerts.
+    pub fn get_lease_notifications(env: Env, lease_id: u64) -> Vec<LeaseNotification> {
+        if validation::validate_nonzero_id(lease_id).is_err() {
+            panic!("Invalid lease ID");
+        }
+
+        let count = storage::get_lease_notification_count(&env, lease_id);
+        let mut notifications = Vec::new(&env);
+        for i in 0..count {
+            if let Some(notification_id) = storage::get_lease_notification_index(&env, lease_id, i) {
+                if let Some(notification) = storage::get_lease_notification(&env, notification_id) {
+                    notifications.push_back(notification);
+                }
+            }
+        }
+        notifications
     }
 
     // ---------------- DYNAMIC FEE ADJUSTMENT ----------------
@@ -3180,5 +3266,741 @@ impl MarketplaceContract {
         }
 
         Ok(())
+    }
+
+    // ---------------- ENHANCED LEASE MANAGEMENT ----------------
+
+    /// Helper to get payment frequency interval in seconds
+    fn get_payment_frequency_interval(frequency: PaymentFrequency) -> u64 {
+        match frequency {
+            PaymentFrequency::Daily => 86400,
+            PaymentFrequency::Weekly => 604800,
+            PaymentFrequency::Monthly => 2592000,
+            PaymentFrequency::Quarterly => 7776000,
+            PaymentFrequency::Yearly => 31536000,
+        }
+    }
+
+    fn get_late_fee_policy(lease: &LeaseData) -> LateFeePolicy {
+        let fee_type = match lease.late_fee_type {
+            1 => LateFeeType::Fixed,
+            2 => LateFeeType::Percentage,
+            3 => LateFeeType::DailyAccumulation,
+            _ => LateFeeType::None,
+        };
+        LateFeePolicy {
+            fee_type,
+            value: lease.late_fee_value,
+        }
+    }
+
+    fn lease_state_label(env: &Env, state: LeaseState) -> String {
+        match state {
+            LeaseState::None => String::from_str(env, "none"),
+            LeaseState::Active => String::from_str(env, "active"),
+            LeaseState::ExtensionRequested => String::from_str(env, "extension_requested"),
+            LeaseState::Terminated => String::from_str(env, "terminated"),
+            LeaseState::Renewed => String::from_str(env, "renewed"),
+            LeaseState::Pending => String::from_str(env, "pending"),
+            LeaseState::Overdue => String::from_str(env, "overdue"),
+            LeaseState::PendingRenewal => String::from_str(env, "pending_renewal"),
+            LeaseState::Expired => String::from_str(env, "expired"),
+        }
+    }
+
+    fn is_live_lease_state(state: LeaseState) -> bool {
+        matches!(
+            state,
+            LeaseState::Active
+                | LeaseState::Renewed
+                | LeaseState::Overdue
+                | LeaseState::PendingRenewal
+                | LeaseState::ExtensionRequested
+        )
+    }
+
+    /// Calculate total payment amount (base + late fees)
+    fn calculate_payment_amount(
+        base_amount: i128,
+        current_time: u64,
+        due_time: u64,
+        late_fee_policy: &LateFeePolicy,
+    ) -> (i128, i128) {
+        if current_time <= due_time {
+            return (base_amount, 0);
+        }
+
+        let late_fee = match late_fee_policy.fee_type {
+            LateFeeType::None => 0,
+            LateFeeType::Fixed => late_fee_policy.value as i128,
+            LateFeeType::Percentage => (base_amount * (late_fee_policy.value as i128)) / 10_000,
+            LateFeeType::DailyAccumulation => {
+                let days_late = (current_time - due_time) / 86400;
+                (late_fee_policy.value as i128) * (days_late as i128)
+            }
+        };
+
+        (base_amount + late_fee, late_fee)
+    }
+
+    fn record_lease_history(
+        env: &Env,
+        lease_id: u64,
+        actor: &Address,
+        action: &str,
+        details: Option<String>,
+        reason: Option<String>,
+        old_status: LeaseState,
+        new_status: LeaseState,
+    ) {
+        let entry = LeaseHistoryEntry {
+            lease_id,
+            action: String::from_str(env, action),
+            actor: actor.clone(),
+            timestamp: env.ledger().timestamp(),
+            details,
+            reason: reason.clone(),
+            old_status,
+            new_status,
+        };
+        storage::add_lease_history(env, lease_id, &entry);
+
+        let operation = match action {
+            "initiated" | "initiated_v2" => OperationType::LeaseStarted,
+            "extension_requested" => OperationType::LeaseExtensionRequested,
+            "extension_approved" => OperationType::LeaseExtended,
+            "auto_renewed" | "renewed" => OperationType::LeaseRenewed,
+            "payment_overdue" => OperationType::LeaseOverdue,
+            "payment_processed" => OperationType::LeasePaymentProcessed,
+            "early_terminated" | "expired" => OperationType::LeaseEnded,
+            _ => {
+                if matches!(new_status, LeaseState::Terminated | LeaseState::Expired) {
+                    OperationType::LeaseEnded
+                } else {
+                    OperationType::LeaseStarted
+                }
+            }
+        };
+        let description = reason.or_else(|| Some(String::from_str(env, action)));
+        let _ = create_audit_log(
+            env,
+            actor.clone(),
+            operation,
+            Self::lease_state_label(env, old_status),
+            Self::lease_state_label(env, new_status),
+            String::from_str(env, "lease_lifecycle"),
+            description,
+        );
+    }
+
+    fn enqueue_lease_notification(
+        env: &Env,
+        lease: &LeaseData,
+        recipient: &Address,
+        channel: LeaseNotificationChannel,
+        message: String,
+        scheduled_for: u64,
+    ) {
+        let notification_id = storage::increment_lease_notification_counter(env);
+        let notification = LeaseNotification {
+            notification_id,
+            lease_id: lease.lease_id,
+            channel,
+            recipient: recipient.clone(),
+            message: message.clone(),
+            created_at: env.ledger().timestamp(),
+            scheduled_for,
+            sent_at: None,
+        };
+        storage::set_lease_notification(env, &notification);
+        storage::add_lease_notification_index(env, lease.lease_id, notification_id);
+
+        env.events().publish(
+            (Symbol::new(env, "LeaseNotificationQueued"),),
+            (lease.lease_id, notification_id, channel as u32, recipient.clone(), message),
+        );
+    }
+
+    fn schedule_renewal_notifications(env: &Env, lease: &mut LeaseData) {
+        let scheduled_for = lease.end_time;
+        if lease.email_notifications_enabled {
+            Self::enqueue_lease_notification(
+                env,
+                lease,
+                &lease.lessee,
+                LeaseNotificationChannel::Email,
+                String::from_str(env, "Lease renewal reminder"),
+                scheduled_for,
+            );
+        }
+        if lease.in_app_notifications_enabled {
+            Self::enqueue_lease_notification(
+                env,
+                lease,
+                &lease.lessee,
+                LeaseNotificationChannel::InApp,
+                String::from_str(env, "Lease expiry reminder"),
+                scheduled_for,
+            );
+        }
+        lease.last_notification_timestamp = env.ledger().timestamp();
+    }
+
+    fn sync_due_payments(env: &Env, lease: &mut LeaseData) {
+        if lease.payment_interval == 0
+            || lease.payment_amount <= 0
+            || lease.next_payment_timestamp == 0
+        {
+            return;
+        }
+
+        let now = env.ledger().timestamp();
+        if now < lease.next_payment_timestamp {
+            return;
+        }
+
+        let late_fee_policy = Self::get_late_fee_policy(lease);
+        let mut due_at = lease.next_payment_timestamp;
+        let mut outstanding_added = 0i128;
+        let mut late_fees_added = 0i128;
+        let mut missed_cycles = 0u32;
+
+        while due_at <= now && due_at < lease.end_time {
+            let (cycle_total, cycle_late_fee) = Self::calculate_payment_amount(
+                lease.payment_amount,
+                now,
+                due_at,
+                &late_fee_policy,
+            );
+            outstanding_added += cycle_total;
+            late_fees_added += cycle_late_fee;
+            missed_cycles += 1;
+            due_at += lease.payment_interval;
+        }
+
+        if missed_cycles == 0 {
+            return;
+        }
+
+        lease.outstanding_balance += outstanding_added;
+        lease.accrued_late_fees += late_fees_added;
+        lease.missed_payments += missed_cycles;
+        lease.next_payment_timestamp = due_at;
+
+        let actor = env.current_contract_address();
+        if lease.status != LeaseState::Overdue {
+            Self::transition_lease_state(
+                env,
+                lease,
+                LeaseState::Overdue,
+                &actor,
+                "payment_overdue",
+                Some(String::from_str(env, "Scheduled payment deadline missed")),
+                Some(String::from_str(env, "late_fees_accrued")),
+            );
+        } else {
+            Self::record_lease_history(
+                env,
+                lease.lease_id,
+                &actor,
+                "payment_overdue",
+                Some(String::from_str(env, "additional_overdue_cycle")),
+                Some(String::from_str(env, "Scheduled payment deadline missed")),
+                LeaseState::Overdue,
+                LeaseState::Overdue,
+            );
+        }
+    }
+
+    fn renew_lease_internal(env: &Env, lease: &mut LeaseData, actor: &Address, action: &str) {
+        let renewal_start = if env.ledger().timestamp() > lease.end_time {
+            env.ledger().timestamp()
+        } else {
+            lease.end_time
+        };
+        lease.start_time = renewal_start;
+        lease.end_time = renewal_start + lease.duration_seconds;
+        lease.current_renewal_count += 1;
+        lease.outstanding_balance = 0;
+        lease.accrued_late_fees = 0;
+        lease.last_notification_timestamp = 0;
+        if lease.payment_interval > 0 && lease.payment_amount > 0 {
+            lease.next_payment_timestamp = renewal_start + lease.payment_interval;
+        }
+        Self::transition_lease_state(
+            env,
+            lease,
+            LeaseState::Renewed,
+            actor,
+            action,
+            Some(String::from_str(env, "Lease term automatically extended")),
+            Some(String::from_str(env, "renewal_executed")),
+        );
+    }
+
+    /// Validate and transition lease state
+    fn transition_lease_state(
+        env: &Env,
+        lease: &mut LeaseData,
+        new_state: LeaseState,
+        actor: &Address,
+        action: &str,
+        reason: Option<String>,
+        details: Option<String>,
+    ) {
+        if lease.status == new_state {
+            Self::record_lease_history(
+                env,
+                lease.lease_id,
+                actor,
+                action,
+                details,
+                reason,
+                lease.status,
+                new_state,
+            );
+            return;
+        }
+
+        match (lease.status, new_state) {
+            (LeaseState::None, LeaseState::Active) => {},
+            (LeaseState::Pending, LeaseState::Active) => {},
+            (LeaseState::Active, LeaseState::ExtensionRequested) => {},
+            (LeaseState::Active, LeaseState::Overdue) => {},
+            (LeaseState::Active, LeaseState::PendingRenewal) => {},
+            (LeaseState::Active, LeaseState::Renewed) => {},
+            (LeaseState::Active, LeaseState::Terminated) => {},
+            (LeaseState::Active, LeaseState::Expired) => {},
+            (LeaseState::Renewed, LeaseState::Active) => {},
+            (LeaseState::Renewed, LeaseState::Overdue) => {},
+            (LeaseState::Renewed, LeaseState::PendingRenewal) => {},
+            (LeaseState::Renewed, LeaseState::Terminated) => {},
+            (LeaseState::Renewed, LeaseState::Expired) => {},
+            (LeaseState::ExtensionRequested, LeaseState::Active) => {},
+            (LeaseState::ExtensionRequested, LeaseState::Terminated) => {},
+            (LeaseState::Overdue, LeaseState::Active) => {},
+            (LeaseState::Overdue, LeaseState::PendingRenewal) => {},
+            (LeaseState::Overdue, LeaseState::Renewed) => {},
+            (LeaseState::Overdue, LeaseState::Terminated) => {},
+            (LeaseState::Overdue, LeaseState::Expired) => {},
+            (LeaseState::PendingRenewal, LeaseState::Active) => {},
+            (LeaseState::PendingRenewal, LeaseState::Renewed) => {},
+            (LeaseState::PendingRenewal, LeaseState::Terminated) => {},
+            (LeaseState::PendingRenewal, LeaseState::Expired) => {},
+            _ => panic!("Invalid state transition"),
+        }
+
+        let old_status = lease.status;
+        lease.status = new_state;
+        Self::record_lease_history(
+            env,
+            lease.lease_id,
+            actor,
+            action,
+            details,
+            reason,
+            old_status,
+            new_state,
+        );
+    }
+
+    /// Mark a lease as overdue
+    pub fn mark_as_overdue(env: Env, lease_id: u64) {
+        let mut lease = storage::get_lease(&env, lease_id).expect("Lease not found");
+        let actor = env.current_contract_address();
+        Self::transition_lease_state(
+            &env,
+            &mut lease,
+            LeaseState::Overdue,
+            &actor,
+            "marked_overdue",
+            Some(String::from_str(&env, "Lease payment obligation is overdue")),
+            Some(String::from_str(&env, "manual_overdue_mark")),
+        );
+        storage::set_lease(&env, &lease);
+
+        env.events().publish(
+            (Symbol::new(&env, "LeaseOverdue"),),
+            (lease_id, lease.lessee),
+        );
+    }
+
+    /// Expire a lease
+    pub fn expire_lease(env: Env, lease_id: u64) {
+        let mut lease = storage::get_lease(&env, lease_id).expect("Lease not found");
+        let actor = env.current_contract_address();
+        Self::transition_lease_state(
+            &env,
+            &mut lease,
+            LeaseState::Expired,
+            &actor,
+            "expired",
+            Some(String::from_str(&env, "Lease reached scheduled expiry")),
+            Some(String::from_str(&env, "lease_expired")),
+        );
+        storage::set_lease(&env, &lease);
+
+        env.events().publish(
+            (Symbol::new(&env, "LeaseExpired"),),
+            (lease_id, lease.lessee),
+        );
+    }
+
+    /// Initiate a lease with enhanced options
+    pub fn initiate_lease_v2(
+        env: Env,
+        listing_id: u64,
+        lessee: Address,
+        duration_seconds: u64,
+        auto_renew: bool,
+        lessee_consent_for_renewal: bool,
+        payment_frequency: PaymentFrequency,
+        payment_amount: i128,
+        termination_penalty_bps: u32,
+        late_fee_policy: LateFeePolicy,
+    ) -> u64 {
+        lessee.require_auth();
+
+        if validation::validate_nonzero_id(listing_id).is_err() {
+            panic!("Invalid listing ID");
+        }
+        if duration_seconds == 0 {
+            panic!("Duration must be positive");
+        }
+        if duration_seconds > stellai_lib::MAX_DURATION_DAYS * 24 * 60 * 60 {
+            panic!("Duration exceeds maximum");
+        }
+        if payment_amount < 0 {
+            panic!("Payment amount cannot be negative");
+        }
+        if termination_penalty_bps > 5000 {
+            panic!("Termination penalty cannot exceed 50%");
+        }
+
+        let listing_key = (Symbol::new(&env, "listing"), listing_id);
+        let mut listing: Listing = env
+            .storage()
+            .instance()
+            .get(&listing_key)
+            .expect("Listing not found");
+
+        if !listing.active {
+            panic!("Listing is not active");
+        }
+        if listing.listing_type != ListingType::Lease {
+            panic!("Listing is not for lease");
+        }
+
+        let lease_id = storage::increment_lease_counter(&env);
+        let now = env.ledger().timestamp();
+        let end_time = now + duration_seconds;
+
+        let config = storage::get_lease_config(&env);
+        let deposit_amount = (listing.price * (config.deposit_bps as i128)) / 10_000;
+        let effective_penalty_bps = if termination_penalty_bps == 0 {
+            config.early_termination_penalty_bps
+        } else {
+            termination_penalty_bps
+        };
+        let interval = if payment_amount > 0 {
+            Self::get_payment_frequency_interval(payment_frequency)
+        } else {
+            0
+        };
+        let next_payment = if interval > 0 { now + interval } else { 0 };
+        if deposit_amount > 0 {
+            let payment_token = storage::get_payment_token(&env);
+            let token_client = token::Client::new(&env, &payment_token);
+            token_client.transfer(&lessee, &env.current_contract_address(), &deposit_amount);
+        }
+
+        let lease = LeaseData {
+            lease_id,
+            agent_id: listing.agent_id,
+            listing_id,
+            lessor: listing.seller.clone(),
+            lessee: lessee.clone(),
+            start_time: now,
+            end_time,
+            duration_seconds,
+            deposit_amount,
+            total_value: listing.price,
+            auto_renew,
+            lessee_consent_for_renewal,
+            status: LeaseState::Active,
+            pending_extension_id: None,
+            payment_interval: interval,
+            payment_amount,
+            next_payment_timestamp: next_payment,
+            max_renewals: if auto_renew { 10 } else { 0 },
+            current_renewal_count: 0,
+            termination_penalty_bps: effective_penalty_bps,
+            late_fee_type: late_fee_policy.fee_type as u32,
+            late_fee_value: late_fee_policy.value,
+            outstanding_balance: 0,
+            accrued_late_fees: 0,
+            total_paid: 0,
+            missed_payments: 0,
+            renewal_notice_period: if auto_renew {
+                if duration_seconds < 86_400 {
+                    duration_seconds / 2
+                } else {
+                    86_400
+                }
+            } else {
+                0
+            },
+            last_notification_timestamp: 0,
+            email_notifications_enabled: true,
+            in_app_notifications_enabled: true,
+            asset_class: AssetClass::Agent,
+        };
+
+        listing.active = false;
+        env.storage().instance().set(&listing_key, &listing);
+        storage::set_lease(&env, &lease);
+        storage::lessee_leases_append(&env, &lessee, lease_id);
+        storage::lessor_leases_append(&env, &listing.seller, lease_id);
+        Self::record_lease_history(
+            &env,
+            lease_id,
+            &lessee,
+            "initiated_v2",
+            Some(String::from_str(&env, "lease_created_with_financial_schedule")),
+            Some(String::from_str(&env, "Lease created and deposit reserved")),
+            LeaseState::None,
+            LeaseState::Active,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "LeaseInitiatedV2"),),
+            (
+                lease_id,
+                listing_id,
+                lessee,
+                duration_seconds,
+                auto_renew,
+                deposit_amount,
+            ),
+        );
+
+        lease_id
+    }
+
+    /// Process a periodic lease payment
+    pub fn process_lease_payment(env: Env, lease_id: u64, payer: Address) {
+        payer.require_auth();
+
+        let mut lease = storage::get_lease(&env, lease_id).expect("Lease not found");
+        assert!(lease.lessee == payer, "Only lessee can pay");
+        assert!(Self::is_live_lease_state(lease.status), "Lease is not active");
+
+        Self::sync_due_payments(&env, &mut lease);
+
+        let now = env.ledger().timestamp();
+        let interval = lease.payment_interval;
+        let mut total_amount = lease.outstanding_balance;
+        let mut late_fee = lease.accrued_late_fees;
+
+        if total_amount == 0 {
+            assert!(interval > 0, "Lease has no payment schedule");
+            let next_payment = lease.next_payment_timestamp;
+            let (scheduled_total, scheduled_late_fee) = Self::calculate_payment_amount(
+                lease.payment_amount,
+                now,
+                next_payment,
+                &Self::get_late_fee_policy(&lease),
+            );
+            total_amount = scheduled_total;
+            late_fee = scheduled_late_fee;
+            lease.next_payment_timestamp = next_payment + interval;
+        }
+
+        let payment_token = storage::get_payment_token(&env);
+        let token_client = token::Client::new(&env, &payment_token);
+        token_client.transfer(&payer, &env.current_contract_address(), &total_amount);
+
+        let platform_fee_bps = Self::get_platform_fee(env.clone());
+        let royalty_info = Self::get_royalty(env.clone(), lease.agent_id);
+
+        Self::route_sale_payment(
+            &env,
+            lease.agent_id,
+            total_amount,
+            &lease.lessee,
+            &lease.lessor,
+            royalty_info,
+            platform_fee_bps,
+            lease.asset_class,
+        );
+
+        lease.total_paid += total_amount;
+        lease.outstanding_balance = 0;
+        lease.accrued_late_fees = 0;
+
+        let actor = payer.clone();
+        if matches!(
+            lease.status,
+            LeaseState::Overdue | LeaseState::PendingRenewal | LeaseState::Renewed
+        ) && now < lease.end_time
+        {
+            Self::transition_lease_state(
+                &env,
+                &mut lease,
+                LeaseState::Active,
+                &actor,
+                "payment_processed",
+                Some(String::from_str(&env, "Outstanding lease balance collected")),
+                Some(String::from_str(&env, "payment_cleared")),
+            );
+        } else {
+            Self::record_lease_history(
+                &env,
+                lease_id,
+                &actor,
+                "payment_processed",
+                Some(String::from_str(&env, "lease_payment_routed")),
+                Some(String::from_str(&env, "Scheduled lease payment collected")),
+                lease.status,
+                lease.status,
+            );
+        }
+
+        storage::set_lease(&env, &lease);
+
+        env.events().publish(
+            (Symbol::new(&env, "LeasePaymentProcessed"),),
+            (lease_id, total_amount, late_fee),
+        );
+    }
+
+    /// Evaluate a single lease for reminders, overdue balances, expiry, or renewal.
+    pub fn process_due_lease(env: Env, lease_id: u64) {
+        let mut lease = storage::get_lease(&env, lease_id).expect("Lease not found");
+        let actor = env.current_contract_address();
+        let now = env.ledger().timestamp();
+
+        Self::sync_due_payments(&env, &mut lease);
+
+        if now < lease.end_time {
+            if lease.auto_renew
+                && lease.renewal_notice_period > 0
+                && (lease.end_time - now) <= lease.renewal_notice_period
+                && lease.last_notification_timestamp == 0
+            {
+                Self::schedule_renewal_notifications(&env, &mut lease);
+                if matches!(lease.status, LeaseState::Active | LeaseState::Renewed) {
+                    Self::transition_lease_state(
+                        &env,
+                        &mut lease,
+                        LeaseState::PendingRenewal,
+                        &actor,
+                        "renewal_notice_sent",
+                        Some(String::from_str(&env, "Renewal reminder queued for lessee")),
+                        Some(String::from_str(&env, "renewal_notifications_queued")),
+                    );
+                }
+            }
+        } else if lease.auto_renew
+            && lease.lessee_consent_for_renewal
+            && (lease.max_renewals == 0 || lease.current_renewal_count < lease.max_renewals)
+            && lease.outstanding_balance == 0
+        {
+            if lease.status != LeaseState::PendingRenewal {
+                Self::transition_lease_state(
+                    &env,
+                    &mut lease,
+                    LeaseState::PendingRenewal,
+                    &actor,
+                    "renewal_window_open",
+                    Some(String::from_str(&env, "Lease entered renewal window")),
+                    Some(String::from_str(&env, "renewal_window_entered")),
+                );
+            }
+            Self::renew_lease_internal(&env, &mut lease, &actor, "auto_renewed");
+        } else if !matches!(lease.status, LeaseState::Expired | LeaseState::Terminated) {
+            Self::transition_lease_state(
+                &env,
+                &mut lease,
+                LeaseState::Expired,
+                &actor,
+                "expired",
+                Some(String::from_str(&env, "Lease reached scheduled expiry without renewal")),
+                Some(String::from_str(&env, "lease_expired")),
+            );
+        }
+
+        storage::set_lease(&env, &lease);
+    }
+
+    /// Process a batch of leases for payment, reminder, renewal, and expiry automation.
+    pub fn process_due_leases(env: Env, start_lease_id: u64, limit: u32) -> u32 {
+        let max_lease_id = storage::get_lease_counter(&env);
+        let mut processed = 0u32;
+        let mut current_lease_id = start_lease_id;
+
+        while processed < limit && current_lease_id <= max_lease_id {
+            if storage::get_lease(&env, current_lease_id).is_some() {
+                Self::process_due_lease(env.clone(), current_lease_id);
+            }
+            processed += 1;
+            current_lease_id += 1;
+        }
+
+        processed
+    }
+
+    /// Automated renewal logic for leases (version 2)
+    pub fn auto_renew_lease_v2(env: Env, lease_id: u64) {
+        let mut lease = storage::get_lease(&env, lease_id).expect("Lease not found");
+        let now = env.ledger().timestamp();
+
+        assert!(now >= lease.end_time, "Lease not yet expired");
+        assert!(lease.auto_renew, "Auto-renew not enabled");
+        assert!(lease.lessee_consent_for_renewal, "Lessee consent not provided");
+        assert!(
+            lease.max_renewals == 0 || lease.current_renewal_count < lease.max_renewals,
+            "Max renewals reached"
+        );
+        assert!(
+            lease.outstanding_balance == 0,
+            "Outstanding balance must be cleared before renewal"
+        );
+
+        let actor = env.current_contract_address();
+        if lease.status != LeaseState::PendingRenewal {
+            Self::transition_lease_state(
+                &env,
+                &mut lease,
+                LeaseState::PendingRenewal,
+                &actor,
+                "renewal_window_open",
+                Some(String::from_str(&env, "Lease entered renewal window")),
+                Some(String::from_str(&env, "renewal_window_entered")),
+            );
+        }
+        Self::renew_lease_internal(&env, &mut lease, &actor, "auto_renewed");
+        storage::set_lease(&env, &lease);
+
+        env.events().publish(
+            (Symbol::new(&env, "LeaseAutoRenewedV2"),),
+            (lease_id, lease.end_time),
+        );
+    }
+
+    /// Calculate current price for a Dutch auction
+    fn calculate_dutch_price(env: Env, auction: &Auction) -> i128 {
+        let now = env.ledger().timestamp();
+        if now >= auction.end_time {
+            return auction.reserve_price;
+        }
+
+        let elapsed = now - auction.start_time;
+        let duration = auction.end_time - auction.start_time;
+
+        let price_diff = auction.start_price - auction.reserve_price;
+        let drop = (price_diff * (elapsed as i128)) / (duration as i128);
+
+        auction.start_price - drop
     }
 }

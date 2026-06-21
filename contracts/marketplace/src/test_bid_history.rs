@@ -1,20 +1,21 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::{Ledger as _, Address as _}, Address, Env};
+use soroban_sdk::{testutils::{Ledger as _, Address as _}, token, Address, Env};
 use stellai_lib::AuctionType;
 
 use crate::{Marketplace, MarketplaceClient};
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-fn setup() -> (Env, MarketplaceClient<'static>) {
+fn setup() -> (Env, MarketplaceClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(admin.clone());
     let id = env.register_contract(None, Marketplace);
     let client = MarketplaceClient::new(&env, &id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    (env, client)
+    client.initialize(&admin, &token_address, &250);
+    (env, client, token_address)
 }
 
 fn create_english_auction(env: &Env, client: &MarketplaceClient, seller: &Address) -> u64 {
@@ -33,9 +34,11 @@ fn create_english_auction(env: &Env, client: &MarketplaceClient, seller: &Addres
 
 #[test]
 fn test_first_bid_recorded_with_zero_increment() {
-    let (env, client) = setup();
+    let (env, client, token_address) = setup();
     let seller = Address::generate(&env);
     let bidder = Address::generate(&env);
+    let token_client = token::StellarAssetClient::new(&env, &token_address);
+    token_client.mint(&bidder, &10_000);
 
     let auction_id = create_english_auction(&env, &client, &seller);
 
@@ -53,11 +56,15 @@ fn test_first_bid_recorded_with_zero_increment() {
 
 #[test]
 fn test_multiple_bids_increment_and_sequence() {
-    let (env, client) = setup();
+    let (env, client, token_address) = setup();
     let seller = Address::generate(&env);
     let b1 = Address::generate(&env);
     let b2 = Address::generate(&env);
     let b3 = Address::generate(&env);
+    let token_client = token::StellarAssetClient::new(&env, &token_address);
+    token_client.mint(&b1, &10_000);
+    token_client.mint(&b2, &10_000);
+    token_client.mint(&b3, &10_000);
 
     let auction_id = create_english_auction(&env, &client, &seller);
 
@@ -89,10 +96,13 @@ fn test_multiple_bids_increment_and_sequence() {
 
 #[test]
 fn test_bid_history_preserves_bidder_identity() {
-    let (env, client) = setup();
+    let (env, client, token_address) = setup();
     let seller = Address::generate(&env);
     let b1 = Address::generate(&env);
     let b2 = Address::generate(&env);
+    let token_client = token::StellarAssetClient::new(&env, &token_address);
+    token_client.mint(&b1, &10_000);
+    token_client.mint(&b2, &10_000);
 
     let auction_id = create_english_auction(&env, &client, &seller);
 
@@ -106,10 +116,13 @@ fn test_bid_history_preserves_bidder_identity() {
 
 #[test]
 fn test_bid_history_timestamps_non_decreasing() {
-    let (env, client) = setup();
+    let (env, client, token_address) = setup();
     let seller = Address::generate(&env);
     let b1 = Address::generate(&env);
     let b2 = Address::generate(&env);
+    let token_client = token::StellarAssetClient::new(&env, &token_address);
+    token_client.mint(&b1, &10_000);
+    token_client.mint(&b2, &10_000);
 
     let auction_id = create_english_auction(&env, &client, &seller);
 
@@ -129,7 +142,7 @@ fn test_bid_history_timestamps_non_decreasing() {
 
 #[test]
 fn test_no_bids_returns_empty_history() {
-    let (env, client) = setup();
+    let (env, client, _token_address) = setup();
     let seller = Address::generate(&env);
 
     let auction_id = create_english_auction(&env, &client, &seller);

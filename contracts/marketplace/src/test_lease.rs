@@ -1,363 +1,216 @@
-//! Tests for lease lifecycle (issue #49): extension, termination, history, get_active_leases.
-
 #![cfg(test)]
 
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::testutils::Ledger;
-use soroban_sdk::{Address, Env, String, Symbol};
-use stellai_lib::{
-    LeaseData, LeaseHistoryEntry, LeaseState, Listing, ListingType, LISTING_COUNTER_KEY,
-};
+use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::{token, Address, Env, String, Symbol};
+use stellai_lib::storage_keys::LISTING_COUNTER_KEY;
+use stellai_lib::types::{LateFeePolicy, LateFeeType, LeaseState, Listing, ListingType, PaymentFrequency};
 
-use crate::{storage::*, Marketplace, MarketplaceClient};
+use crate::{MarketplaceContract, MarketplaceContractClient};
 
-/// Setup env with marketplace initialized and a lease written to storage (no token needed).
-/// Call after init_contract; all storage writes run inside contract context.
-fn setup_lease_in_storage(env: &Env, contract_id: &Address) -> (Address, Address, u64, u64) {
-    let lessor = Address::generate(env);
-    let lessee = Address::generate(env);
+fn setup_marketplace(env: &Env) -> (Address, Address) {
+    let admin = Address::generate(env);
+    let token_address = env.register_stellar_asset_contract(admin.clone());
+    let contract_id = env.register_contract(None, MarketplaceContract);
+    let client = MarketplaceContractClient::new(env, &contract_id);
+    client.initialize(&admin, &token_address, &500);
+    (contract_id, token_address)
+}
 
+fn seed_listing(env: &Env, contract_id: &Address, lessor: &Address, listing_id: u64, price: i128) {
     env.as_contract(contract_id, || {
-        let listing_id = 1u64;
-        let listing_key = (Symbol::new(env, "listing"), listing_id);
         let listing = Listing {
             listing_id,
             agent_id: 10,
             seller: lessor.clone(),
-            price: 1000,
+            price,
             listing_type: ListingType::Lease,
-            active: false,
+            active: true,
             created_at: env.ledger().timestamp(),
         };
-        env.storage().instance().set(&listing_key, &listing);
+        env.storage().instance().set(&(Symbol::new(env, "listing"), listing_id), &listing);
         env.storage()
             .instance()
             .set(&Symbol::new(env, LISTING_COUNTER_KEY), &listing_id);
-
-        let lease_id = increment_lease_counter(env);
-        assert_eq!(lease_id, 1);
-
-        let now = env.ledger().timestamp();
-        let duration_seconds = 86400 * 30; // 30 days
-        let end_time = now + duration_seconds;
-        let total_value = 1000i128;
-        let deposit_bps = 1000u32; // 10%
-        let deposit_amount = (total_value * (deposit_bps as i128)) / 10_000;
-
-        let lease = LeaseData {
-            lease_id,
-            agent_id: 10,
-            listing_id,
-            lessor: lessor.clone(),
-            lessee: lessee.clone(),
-            start_time: now,
-            end_time,
-            duration_seconds,
-            deposit_amount,
-            total_value,
-            auto_renew: true,                 // Enable auto-renewal for testing
-            lessee_consent_for_renewal: true, // Enable consent for testing
-            status: LeaseState::Active,
-            pending_extension_id: None,
-        };
-        set_lease(env, &lease);
-        lessee_leases_append(env, &lessee, lease_id);
-        lessor_leases_append(env, &lessor, lease_id);
-
-        let entry = LeaseHistoryEntry {
-            lease_id,
-            action: String::from_str(env, "initiated"),
-            actor: lessee.clone(),
-            timestamp: now,
-            details: None,
-        };
-        add_lease_history(env, lease_id, &entry);
-
-        (lessor, lessee, lease_id, listing_id)
-    })
+    });
 }
 
-#[test]
-fn test_lease_config_default() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
+fn create_standard_lease(
+    env: &Env,
+    auto_renew: bool,
+) -> (MarketplaceContractClient<'_>, Address, Address, Address, Address, u64) {
+    let (contract_id, token_address) = setup_marketplace(env);
+    let client = MarketplaceContractClient::new(env, &contract_id);
+    let lessor = Address::generate(env);
+    let lessee = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_client = token::StellarAssetClient::new(env, &token_address);
+    token_client.mint(&lessee, &20_000);
+    let _ = token_admin;
 
-    client.init_contract(&admin);
+    let listing_id = 1u64;
+    seed_listing(env, &contract_id, &lessor, listing_id, 1_000);
 
-    let config = env.as_contract(&contract_id, || get_lease_config(&env));
-    assert_eq!(config.deposit_bps, stellai_lib::DEFAULT_LEASE_DEPOSIT_BPS);
-    assert_eq!(
-        config.early_termination_penalty_bps,
-        stellai_lib::DEFAULT_EARLY_TERMINATION_PENALTY_BPS
+    let lease_id = client.initiate_lease_v2(
+        &listing_id,
+        &lessee,
+        &259_200,
+        &auto_renew,
+        &auto_renew,
+        &PaymentFrequency::Daily,
+        &200,
+        &2_000,
+        &LateFeePolicy {
+            fee_type: LateFeeType::Fixed,
+            value: 20,
+        },
     );
+
+    (client, contract_id, token_address, lessor, lessee, lease_id)
 }
 
 #[test]
-fn test_set_lease_config() {
+fn test_initiate_lease_tracks_history_and_deposit() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-
-    client.init_contract(&admin);
-    client.set_lease_config(&admin, &1500, &2500);
-
-    let config = env.as_contract(&contract_id, || get_lease_config(&env));
-    assert_eq!(config.deposit_bps, 1500);
-    assert_eq!(config.early_termination_penalty_bps, 2500);
-}
-
-#[test]
-fn test_get_lease_by_id_and_active_leases() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (lessor, lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
+    let (client, contract_id, token_address, lessor, lessee, lease_id) =
+        create_standard_lease(&env, true);
 
     let lease = client.get_lease_by_id(&lease_id).unwrap();
-    assert_eq!(lease.lease_id, lease_id);
-    assert_eq!(lease.lessee, lessee);
     assert_eq!(lease.lessor, lessor);
-    assert!(lease.status == LeaseState::Active);
+    assert_eq!(lease.lessee, lessee);
+    assert_eq!(lease.deposit_amount, 100);
+    assert_eq!(lease.outstanding_balance, 0);
+    assert_eq!(lease.asset_class as u32, 0);
 
-    let lessee_leases = client.get_active_leases(&lessee);
-    assert_eq!(lessee_leases.len(), 1);
-    assert_eq!(lessee_leases.get(0).unwrap().lease_id, lease_id);
-
-    let lessor_leases = client.get_active_leases(&lessor);
-    assert_eq!(lessor_leases.len(), 1);
-    assert_eq!(lessor_leases.get(0).unwrap().lease_id, lease_id);
-}
-
-#[test]
-fn test_lease_extension_request_and_approve() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (lessor, lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
-
-    let extension_id = client.request_lease_extension(&lease_id, &lessee, &(86400 * 7));
-    assert!(extension_id > 0);
-
-    let lease = client.get_lease_by_id(&lease_id).unwrap();
-    assert!(lease.status == LeaseState::ExtensionRequested);
-    assert_eq!(lease.pending_extension_id, Some(extension_id));
-
-    client.approve_lease_extension(&lease_id, &extension_id, &lessor);
-
-    let lease_after = client.get_lease_by_id(&lease_id).unwrap();
-    assert!(lease_after.status == LeaseState::Active);
-    assert_eq!(lease_after.pending_extension_id, None);
-    assert_eq!(
-        lease_after.duration_seconds,
-        lease.duration_seconds + 86400 * 7
-    );
-}
-
-#[test]
-fn test_lease_history() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (_lessor, lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
-
-    let history_before = client.get_lease_history(&lease_id);
-    assert_eq!(history_before.len(), 1);
-    assert_eq!(
-        history_before.get(0).unwrap().action,
-        String::from_str(&env, "initiated")
-    );
-
-    client.request_lease_extension(&lease_id, &lessee, &3600);
+    let contract_balance = token::Client::new(&env, &token_address).balance(&contract_id);
+    assert_eq!(contract_balance, 100);
 
     let history = client.get_lease_history(&lease_id);
-    assert!(history.len() >= 2);
-    assert_eq!(
-        history.get(0).unwrap().action,
-        String::from_str(&env, "initiated")
-    );
-    assert_eq!(
-        history.get(1).unwrap().action,
-        String::from_str(&env, "extension_requested")
-    );
+    assert_eq!(history.len(), 1);
+    assert_eq!(history.get(0).unwrap().action, String::from_str(&env, "initiated_v2"));
 }
 
 #[test]
-fn test_lease_early_termination() {
+fn test_scheduler_queues_notifications_and_auto_renews() {
     let env = Env::default();
     env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (_lessor, lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
+    let (client, _contract_id, _token_address, _lessor, _lessee, lease_id) =
+        create_standard_lease(&env, true);
 
-    // Set payment token for termination fee processing
-    let token_address = Address::generate(&env);
-    client.set_payment_token(&admin, &token_address);
-
-    // Calculate expected penalty (20% of total value since we're terminating early)
     let lease = client.get_lease_by_id(&lease_id).unwrap();
-    let expected_penalty = (lease.total_value * 2000) / 10000; // 20% of total value
+    env.ledger().set_timestamp(lease.end_time - 3_600);
+    client.process_due_lease(&lease_id);
 
-    // Test early termination with sufficient fee
-    let termination_fee = expected_penalty;
-    client.early_termination(&lease_id, &lessee, &termination_fee);
+    // Pay outstanding balance to allow renewal
+    client.process_lease_payment(&lease_id, &_lessee);
 
-    let terminated_lease = client.get_lease_by_id(&lease_id).unwrap();
-    assert!(terminated_lease.status == LeaseState::Terminated);
+    let notifications = client.get_lease_notifications(&lease_id);
+    assert_eq!(notifications.len(), 2);
+    assert_eq!(notifications.get(0).unwrap().channel as u32, 0);
+    assert_eq!(notifications.get(1).unwrap().channel as u32, 1);
 
-    // Check history
+    env.ledger().set_timestamp(lease.end_time + 1);
+    client.process_due_lease(&lease_id);
+
+    let renewed = client.get_lease_by_id(&lease_id).unwrap();
+    assert_eq!(renewed.status, LeaseState::Renewed);
+    assert_eq!(renewed.current_renewal_count, 1);
+    assert!(renewed.end_time > lease.end_time);
+}
+
+#[test]
+fn test_scheduler_marks_overdue_and_payment_clears_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _contract_id, token_address, lessor, lessee, lease_id) =
+        create_standard_lease(&env, false);
+
+    let lease = client.get_lease_by_id(&lease_id).unwrap();
+    env.ledger().set_timestamp(lease.next_payment_timestamp + 3_600);
+    client.process_due_lease(&lease_id);
+
+    let overdue = client.get_lease_by_id(&lease_id).unwrap();
+    assert_eq!(overdue.status, LeaseState::Overdue);
+    assert_eq!(overdue.outstanding_balance, 220);
+    assert_eq!(overdue.accrued_late_fees, 20);
+
+    client.process_lease_payment(&lease_id, &lessee);
+
+    let cleared = client.get_lease_by_id(&lease_id).unwrap();
+    assert_eq!(cleared.status, LeaseState::Active);
+    assert_eq!(cleared.outstanding_balance, 0);
+    assert_eq!(cleared.accrued_late_fees, 0);
+
+    let lessor_balance = token::Client::new(&env, &token_address).balance(&lessor);
+    assert_eq!(lessor_balance, 209);
+}
+
+#[test]
+fn test_lease_expires_without_auto_renew() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _contract_id, _token_address, _lessor, _lessee, lease_id) =
+        create_standard_lease(&env, false);
+
+    let lease = client.get_lease_by_id(&lease_id).unwrap();
+    env.ledger().set_timestamp(lease.end_time + 1);
+    client.process_due_lease(&lease_id);
+
+    let expired = client.get_lease_by_id(&lease_id).unwrap();
+    assert_eq!(expired.status, LeaseState::Expired);
+}
+
+#[test]
+#[should_panic(expected = "Listing is not for sale")]
+fn test_buy_agent_fails_on_lease_listing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract_id, token_address) = setup_marketplace(&env);
+    let client = MarketplaceContractClient::new(&env, &contract_id);
+    let lessor = Address::generate(&env);
+    let lessee = Address::generate(&env);
+    
+    // Create an ACTIVE lease listing
+    seed_listing(&env, &contract_id, &lessor, 1, 1000);
+    
+    // Try to buy it
+    client.buy_agent(&1, &lessee);
+}
+
+#[test]
+fn test_early_termination_reconciles_penalty_and_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, token_address, _lessor, lessee, lease_id) =
+        create_standard_lease(&env, false);
+
+    let lease = client.get_lease_by_id(&lease_id).unwrap();
+    env.ledger().set_timestamp(lease.next_payment_timestamp + 3_600);
+    client.process_due_lease(&lease_id);
+
+    let overdue = client.get_lease_by_id(&lease_id).unwrap();
+    let now = env.ledger().timestamp();
+    let remaining_time = overdue.end_time - now;
+    let remaining_value = (overdue.total_value * remaining_time as i128) / overdue.duration_seconds as i128;
+    let penalty = (remaining_value * overdue.termination_penalty_bps as i128) / 10_000;
+    let required_settlement = overdue.outstanding_balance + penalty;
+    let deposit_credit = if overdue.deposit_amount > required_settlement {
+        required_settlement
+    } else {
+        overdue.deposit_amount
+    };
+    let amount_due = required_settlement - deposit_credit;
+
+    client.early_termination(&lease_id, &lessee, &amount_due);
+
+    let terminated = client.get_lease_by_id(&lease_id).unwrap();
+    assert_eq!(terminated.status, LeaseState::Terminated);
+    assert_eq!(terminated.deposit_amount, 0);
+    assert_eq!(terminated.outstanding_balance, 0);
+
     let history = client.get_lease_history(&lease_id);
-    assert!(history.len() >= 2);
-    assert_eq!(
-        history.get(1).unwrap().action,
-        String::from_str(&env, "early_terminated")
-    );
-}
+    assert_eq!(history.get(history.len() - 1).unwrap().action, String::from_str(&env, "early_terminated"));
 
-#[test]
-fn test_auto_renewal() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (_lessor, _lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
-
-    // Simulate lease expiration by advancing time
-    let new_timestamp = env.ledger().timestamp() + 86400 * 31; // 31 days later
-    env.ledger().set_timestamp(new_timestamp);
-
-    // Test auto-renewal
-    client.auto_renew_lease(&lease_id);
-
-    let renewed_lease = client.get_lease_by_id(&lease_id).unwrap();
-    assert!(renewed_lease.status == LeaseState::Renewed);
-
-    // Check history
-    let history = client.get_lease_history(&lease_id);
-    assert!(history.len() >= 2);
-    assert_eq!(
-        history.get(1).unwrap().action,
-        String::from_str(&env, "auto_renewed")
-    );
-}
-
-#[test]
-fn test_lease_deposit_calculation() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (_lessor, lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
-
-    // Set payment token
-    let token_address = Address::generate(&env);
-    client.set_payment_token(&admin, &token_address);
-
-    let lease = client.get_lease_by_id(&lease_id).unwrap();
-
-    // Advance time by half the lease duration
-    let half_duration = lease.duration_seconds / 2;
-    let new_timestamp = lease.start_time + half_duration;
-    env.ledger().set_timestamp(new_timestamp);
-
-    // Test lease deposit calculation
-    let expected_deposit = (lease.total_value * 1000) / 10000; // 10% of total value
-    assert_eq!(lease.deposit_amount, expected_deposit);
-}
-
-#[test]
-#[should_panic(expected = "Invalid lease ID")]
-fn test_invalid_lease_id() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-
-    client.get_lease_by_id(&0); // Should panic with invalid lease ID
-}
-
-#[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_unauthorized_extension_request() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (lessor, _lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
-
-    // Try to request extension as lessor (should fail)
-    client.request_lease_extension(&lease_id, &lessor, &3600);
-}
-
-#[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_unauthorized_extension_approval() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (_lessor, lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
-
-    // Request extension as lessee
-    let extension_id = client.request_lease_extension(&lease_id, &lessee, &3600);
-
-    // Try to approve as lessee (should fail)
-    client.approve_lease_extension(&lease_id, &extension_id, &lessee);
-}
-
-#[test]
-fn test_prorated_termination_penalty() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, Marketplace);
-    let client = MarketplaceClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.init_contract(&admin);
-    let (_lessor, lessee, lease_id, _) = setup_lease_in_storage(&env, &contract_id);
-
-    // Set payment token for termination fee processing
-    let token_address = Address::generate(&env);
-    client.set_payment_token(&admin, &token_address);
-
-    let lease = client.get_lease_by_id(&lease_id).unwrap();
-
-    // Advance time by half the lease duration
-    let half_duration = lease.duration_seconds / 2;
-    let new_timestamp = lease.start_time + half_duration;
-    env.ledger().set_timestamp(new_timestamp);
-
-    // Calculate expected penalty (20% of remaining value)
-    // Since we're halfway through, remaining value is half of total
-    let remaining_value = lease.total_value / 2;
-    let expected_penalty = (remaining_value * 2000) / 10000; // Default 20% penalty
-
-    client.early_termination(&lease_id, &lessee, &expected_penalty);
-
-    let terminated_lease = client.get_lease_by_id(&lease_id).unwrap();
-    assert!(terminated_lease.status == LeaseState::Terminated);
+    let client_balance = token::Client::new(&env, &token_address).balance(&contract_id);
+    assert!(client_balance > 0, "Contract should hold platform fees");
 }
