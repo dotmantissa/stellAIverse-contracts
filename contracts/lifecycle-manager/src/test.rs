@@ -224,6 +224,9 @@ fn test_ttl_config_values_match_spec() {
     assert_eq!(DEFAULT_ACTIVE_TTL, 52560);
     assert_eq!(DEFAULT_HISTORICAL_TTL, 26280);
     assert_eq!(DEFAULT_ARCHIVED_TTL, 5256);
-    assert!(DEFAULT_ACTIVE_TTL > DEFAULT_HISTORICAL_TTL);
-    assert!(DEFAULT_HISTORICAL_TTL > DEFAULT_ARCHIVED_TTL);
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(DEFAULT_ACTIVE_TTL > DEFAULT_HISTORICAL_TTL);
+        assert!(DEFAULT_HISTORICAL_TTL > DEFAULT_ARCHIVED_TTL);
+    }
 }

@@ -7,13 +7,5 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-soroban-sdk = { version = "22.0.11", default-features = false }
+soroban-sdk = { workspace = true, default-features = false }
 stellai_lib = { path = "../../lib" }
-
-[profile.release]
-codegen-units = 1
-opt-level = 'z'
-lto = true
-panic = "abort"
-debug = false
-strip = "symbols"
