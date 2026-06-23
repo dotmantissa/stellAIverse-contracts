@@ -105,7 +105,8 @@ pub struct AnomalyScore {
 #[contracttype]
 pub struct Listing {
     pub listing_id: u64,
-    pub agent_id: u64,
+    pub asset_id: u64,
+    pub asset_type: AssetType,
     pub seller: Address,
     pub price: i128,
     pub listing_type: ListingType,
@@ -113,13 +114,65 @@ pub struct Listing {
     pub created_at: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Listing types supported by the marketplace
 #[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ListingType {
     Sale = 0,
     Lease = 1,
     Auction = 2,
+}
+
+/// Represents prediction market outcome
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PredictionOutcome {
+    Yes = 0,
+    No = 1,
+    Invalid = 2,
+}
+
+/// Represents a prediction market
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct PredictionMarket {
+    pub market_id: u64,
+    pub question: String,
+    pub category: String,
+    pub end_timestamp: u64,
+    pub resolved: bool,
+    pub outcome: PredictionOutcome, // Uses PredictionOutcome::Invalid for unresolved markets
+    pub total_shares_yes: u128,
+    pub total_shares_no: u128,
+    pub oracle_address: Address,
+    pub created_at: u64,
+    pub creator: Address,
+}
+
+/// Represents a user's shares in a prediction market
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct PredictionShares {
+    pub shares_id: u64,
+    pub market_id: u64,
+    pub owner: Address,
+    pub shares_yes: u128,
+    pub shares_no: u128,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub escrow_locked: bool,
+    pub escrow_holder: Option<Address>,
+}
+
+/// Asset types supported by the marketplace
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AssetType {
+    Agent = 0,
+    PredictionShares = 1,
 }
 
 /// Represents an evolution/upgrade request
@@ -233,13 +286,38 @@ pub enum OptionalRoyaltyConfig {
     Some(RoyaltyConfig),
 }
 
-#[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
 #[repr(u32)]
 pub enum AuctionType {
     English = 0,
     Dutch = 1,
     Sealed = 2,
+}
+
+/// Represents a dispute for a marketplace transaction
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct Dispute {
+    pub dispute_id: u64,
+    pub listing_id: u64,
+    pub asset_type: AssetType,
+    pub initiator: Address,
+    pub reason: String,
+    pub evidence_cid: Option<String>,
+    pub status: DisputeStatus,
+    pub created_at: u64,
+    pub resolved_at: Option<u64>,
+}
+
+/// Status of a dispute
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+#[repr(u32)]
+pub enum DisputeStatus {
+    Open = 0,
+    Resolved = 1,
+    Rejected = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
