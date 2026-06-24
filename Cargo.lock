@@ -564,6 +564,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
+name = "execution-hub"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "stellai_lib",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -818,6 +826,14 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "marketplace"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "stellai_lib",
+]
 
 [[package]]
 name = "memchr"
