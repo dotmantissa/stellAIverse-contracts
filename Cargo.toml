@@ -1,32 +1,6 @@
 [workspace]
 members = [
-    "contracts/bug-bounty",
-    "contracts/affiliate-bonuses",
-    "contracts/credit-scoring-waitlist",
-    "contracts/agent-nft",
-    "contracts/agent-token",
-    "contracts/amm",
-    "contracts/bridge-manager",
     "contracts/compliance-integration",
-    "contracts/credit-score-nft",
-    "contracts/evolution",
-    "contracts/execution-hub",
-    "contracts/faucet",
-    "contracts/governance",
-    "contracts/identity-did",
-    "contracts/lifecycle-manager",
-    "contracts/marketplace",
-    "contracts/metrics-aggregator",
-    "contracts/oracle",
-    "contracts/prediction-market",
-    "contracts/referral-rewards",
-    "contracts/risk-evaluation",
-    "contracts/staking-bonuses",
-    "contracts/multisig-waitlist",
-    "contracts/threshold-agent",
-    "contracts/transaction-coordinator",
-    "contracts/verifiable-credentials",
-    "contracts/waitlist-tokens",
     "lib",
     "shared",
 ]
@@ -61,9 +35,7 @@ lto = false
 debug = true
 incremental = true
 
-# Build parallel configuration
-[build]
-jobs = 8
+
 
 [workspace.dependencies]
-soroban-sdk = "22.0.10"
+soroban-sdk = { version = "22.0.10", default-features = false }

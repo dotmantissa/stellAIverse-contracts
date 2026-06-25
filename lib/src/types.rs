@@ -105,7 +105,8 @@ pub struct AnomalyScore {
 #[contracttype]
 pub struct Listing {
     pub listing_id: u64,
-    pub agent_id: u64,
+    pub asset_id: u64,
+    pub asset_type: AssetType,
     pub seller: Address,
     pub price: i128,
     pub listing_type: ListingType,
@@ -113,13 +114,65 @@ pub struct Listing {
     pub created_at: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Listing types supported by the marketplace
 #[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ListingType {
     Sale = 0,
     Lease = 1,
     Auction = 2,
+}
+
+/// Represents prediction market outcome
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PredictionOutcome {
+    Yes = 0,
+    No = 1,
+    Invalid = 2,
+}
+
+/// Represents a prediction market
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct PredictionMarket {
+    pub market_id: u64,
+    pub question: String,
+    pub category: String,
+    pub end_timestamp: u64,
+    pub resolved: bool,
+    pub outcome: PredictionOutcome, // Uses PredictionOutcome::Invalid for unresolved markets
+    pub total_shares_yes: u128,
+    pub total_shares_no: u128,
+    pub oracle_address: Address,
+    pub created_at: u64,
+    pub creator: Address,
+}
+
+/// Represents a user's shares in a prediction market
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct PredictionShares {
+    pub shares_id: u64,
+    pub market_id: u64,
+    pub owner: Address,
+    pub shares_yes: u128,
+    pub shares_no: u128,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub escrow_locked: bool,
+    pub escrow_holder: Option<Address>,
+}
+
+/// Asset types supported by the marketplace
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AssetType {
+    Agent = 0,
+    PredictionShares = 1,
 }
 
 /// Represents an evolution/upgrade request
@@ -167,8 +220,8 @@ pub struct RoyaltyRecipient {
 #[contracttype]
 pub struct RoyaltyConfig {
     pub recipients: Vec<RoyaltyRecipient>,
-    pub total_bps: u32, // Total basis points (should equal sum of shares)
-    pub min_threshold: i128, // Minimum sale price to trigger royalties
+    pub total_bps: u32,        // Total basis points (should equal sum of shares)
+    pub min_threshold: i128,   // Minimum sale price to trigger royalties
     pub max_cap: Option<i128>, // Optional maximum royalty amount
 }
 
@@ -233,13 +286,38 @@ pub enum OptionalRoyaltyConfig {
     Some(RoyaltyConfig),
 }
 
-#[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
 #[repr(u32)]
 pub enum AuctionType {
     English = 0,
     Dutch = 1,
     Sealed = 2,
+}
+
+/// Represents a dispute for a marketplace transaction
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct Dispute {
+    pub dispute_id: u64,
+    pub listing_id: u64,
+    pub asset_type: AssetType,
+    pub initiator: Address,
+    pub reason: String,
+    pub evidence_cid: Option<String>,
+    pub status: DisputeStatus,
+    pub created_at: u64,
+    pub resolved_at: Option<u64>,
+}
+
+/// Status of a dispute
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+#[repr(u32)]
+pub enum DisputeStatus {
+    Open = 0,
+    Resolved = 1,
+    Rejected = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,56 +464,69 @@ pub struct EvolutionAttestation {
 }
 
 /// State of a lease in its lifecycle.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[contracttype]
 #[repr(u32)]
 pub enum LeaseState {
-    Active = 0,
-    ExtensionRequested = 1,
-    Terminated = 2,
-    Renewed = 3,
+    None = 0,
+    Active = 1,
+    ExtensionRequested = 2,
+    Terminated = 3,
+    Renewed = 4,
+    Pending = 5,
+    Overdue = 6,
+    PendingRenewal = 7,
+    Expired = 8,
 }
 
-/// Full lease record: duration, renewal terms, termination conditions, deposit.
+/// Frequency of lease payments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[contracttype]
+#[repr(u32)]
+pub enum PaymentFrequency {
+    Daily = 0,
+    Weekly = 1,
+    Monthly = 2,
+    Quarterly = 3,
+    Yearly = 4,
+}
+
+/// Type of late fee policy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[contracttype]
+#[repr(u32)]
+pub enum LateFeeType {
+    None = 0,
+    Fixed = 1,
+    Percentage = 2,
+    DailyAccumulation = 3,
+}
+
+/// Late fee policy configuration.
 #[derive(Clone)]
 #[contracttype]
-pub struct LeaseData {
-    pub lease_id: u64,
-    pub agent_id: u64,
-    pub listing_id: u64,
-    pub lessor: Address,
-    pub lessee: Address,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub duration_seconds: u64,
-    pub deposit_amount: i128,
-    pub total_value: i128,
+pub struct LateFeePolicy {
+    pub fee_type: LateFeeType,
+    pub value: u128,
+}
+
+/// Renewal policy configuration.
+#[derive(Clone)]
+#[contracttype]
+pub struct RenewalPolicy {
     pub auto_renew: bool,
-    pub lessee_consent_for_renewal: bool,
-    pub status: LeaseState,
-    pub pending_extension_id: Option<u64>,
+    pub min_notice_period: u64,
+    pub max_renewals: u32,
+    pub current_renewal_count: u32,
 }
 
-/// A request to extend an active lease by additional duration.
-#[derive(Clone)]
+/// Delivery channel for lease renewal and payment notifications.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[contracttype]
-pub struct LeaseExtensionRequest {
-    pub extension_id: u64,
-    pub lease_id: u64,
-    pub additional_duration_seconds: u64,
-    pub requested_at: u64,
-    pub approved: bool,
-}
-
-/// Single entry in lease history (for lessee/lessor audit).
-#[derive(Clone)]
-#[contracttype]
-pub struct LeaseHistoryEntry {
-    pub lease_id: u64,
-    pub action: String,
-    pub actor: Address,
-    pub timestamp: u64,
-    pub details: Option<String>,
+#[repr(u32)]
+pub enum LeaseNotificationChannel {
+    Email = 0,
+    InApp = 1,
 }
 
 /// Transaction status in the two-phase commit protocol
@@ -468,6 +559,83 @@ pub struct TransactionStep {
     pub rollback_args: Option<Vec<Val>>,
     pub executed: bool,
     pub result: Option<String>,
+}
+
+/// Full lease record: duration, renewal terms, termination conditions, deposit.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct LeaseData {
+    pub lease_id: u64,
+    pub agent_id: u64,
+    pub listing_id: u64,
+    pub lessor: Address,
+    pub lessee: Address,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub duration_seconds: u64,
+    pub deposit_amount: i128,
+    pub total_value: i128,
+    pub auto_renew: bool,
+    pub lessee_consent_for_renewal: bool,
+    pub status: LeaseState,
+    pub pending_extension_id: Option<u64>,
+    // Advanced Lease Management Fields (Flat structure for robustness)
+    pub payment_interval: u64,
+    pub payment_amount: i128,
+    pub next_payment_timestamp: u64,
+    pub max_renewals: u32,
+    pub current_renewal_count: u32,
+    pub termination_penalty_bps: u32,
+    pub late_fee_type: u32,
+    pub late_fee_value: u128,
+    pub outstanding_balance: i128,
+    pub accrued_late_fees: i128,
+    pub total_paid: i128,
+    pub missed_payments: u32,
+    pub renewal_notice_period: u64,
+    pub last_notification_timestamp: u64,
+    pub email_notifications_enabled: bool,
+    pub in_app_notifications_enabled: bool,
+    pub asset_class: AssetClass,
+}
+
+/// A request to extend an active lease by additional duration.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct LeaseExtensionRequest {
+    pub extension_id: u64,
+    pub lease_id: u64,
+    pub additional_duration_seconds: u64,
+    pub requested_at: u64,
+    pub approved: bool,
+}
+
+/// Single entry in lease history (for lessee/lessor audit).
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct LeaseHistoryEntry {
+    pub lease_id: u64,
+    pub action: String,
+    pub actor: Address,
+    pub timestamp: u64,
+    pub details: Option<String>,
+    pub reason: Option<String>,
+    pub old_status: LeaseState,
+    pub new_status: LeaseState,
+}
+
+/// Immutable notification record for off-chain delivery workers and in-app UX.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct LeaseNotification {
+    pub notification_id: u64,
+    pub lease_id: u64,
+    pub channel: LeaseNotificationChannel,
+    pub recipient: Address,
+    pub message: String,
+    pub created_at: u64,
+    pub scheduled_for: u64,
+    pub sent_at: Option<u64>,
 }
 
 /// Atomic transaction containing multiple coordinated steps

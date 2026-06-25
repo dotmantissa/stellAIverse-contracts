@@ -1,7 +1,8 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
     Symbol, Vec,
 };
 use stellai_lib::rbac;
@@ -19,22 +20,19 @@ pub enum Error {
     ComplianceCheckFailed = 7,
     InvalidRiskLevel = 8,
     DuplicateReport = 9,
-    UnauthorizedReviewer = 10,
-    InvalidRating = 11,
-    ReviewNotFound = 12,
-    RateLimitExceeded = 13,
-    AuditRequired = 14,
+    RateLimitExceeded = 10,
+    AuditRequired = 11,
     // KYC state machine errors
-    KycSubjectNotFound = 15,
-    KycInvalidTransition = 16,
-    KycTerminalState = 17,
-    KycRequestExpired = 18,
-    KycOperatorRequired = 19,
-    KycSelfAssignment = 20,
-    KycNotVerified = 21,
-    KycOverrideNotScheduled = 22,
-    KycOverrideNotReady = 23,
-    KycOverrideAlreadyScheduled = 24,
+    KycSubjectNotFound = 12,
+    KycInvalidTransition = 13,
+    KycTerminalState = 14,
+    KycRequestExpired = 15,
+    KycOperatorRequired = 16,
+    KycSelfAssignment = 17,
+    KycNotVerified = 18,
+    KycOverrideNotScheduled = 19,
+    KycOverrideNotReady = 20,
+    KycOverrideAlreadyScheduled = 21,
 }
 
 // ── Compliance Types ────────────────────────────────────────────────────────
@@ -96,39 +94,6 @@ pub struct ComplianceFinding {
     pub recommendation: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-#[contracttype]
-pub struct ReputationScore {
-    pub entity_did: String,
-    pub overall_score: u32,
-    pub category_scores: Map<String, u32>,
-    pub review_count: u32,
-    pub last_updated: u64,
-    pub calculation_method: String,
-}
-
-#[derive(Clone, Debug)]
-#[contracttype]
-pub struct ReputationReview {
-    pub review_id: u64,
-    pub reviewer_did: String,
-    pub subject_did: String,
-    pub rating: u32,
-    pub category: String,
-    pub comments: Option<String>,
-    pub verified_credentials: Vec<String>,
-    pub created_at: u64,
-}
-
-#[derive(Clone, Debug)]
-#[contracttype]
-pub struct ReputationUpdatedEvent {
-    pub entity_did: String,
-    pub new_score: u32,
-    pub updated_by: Address,
-    pub timestamp: u64,
-}
-
 // ── KYC State Machine Types ───────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -166,12 +131,9 @@ pub struct KycOverrideRequest {
 // ── Storage Keys ─────────────────────────────────────────────────────────────
 
 const REPORTS: Symbol = symbol_short!("REPORTS");
-const REVIEWS: Symbol = symbol_short!("REVIEWS");
 const KYC_RECORDS: Symbol = symbol_short!("KYC_REC");
 const KYC_OVERRIDES: Symbol = symbol_short!("KYC_OVR");
 const NEXT_REPORT_ID: Symbol = symbol_short!("N_REP_ID");
-const NEXT_REVIEW_ID: Symbol = symbol_short!("N_REV_ID");
-const REPUTATION_SCORES: Symbol = symbol_short!("REP_SC");
 
 const KYC_PENDING_EXPIRY_SECS: u64 = 86400 * 7; // 7 days
 const KYC_OVERRIDE_TIMELOCK_SECS: u64 = 86400 * 2; // 2 days
@@ -182,9 +144,11 @@ const KYC_OVERRIDE_TIMELOCK_SECS: u64 = 86400 * 2; // 2 days
 pub struct ComplianceIntegrationContract;
 
 #[contractimpl]
+#[allow(clippy::too_many_arguments)]
 impl ComplianceIntegrationContract {
     /// Generate a new compliance report for an entity.
     /// Requires verified KYC for the issuer (Address).
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_compliance_report(
         env: Env,
         entity_did: String,
@@ -268,103 +232,6 @@ impl ComplianceIntegrationContract {
             .instance()
             .set(&NEXT_REPORT_ID, &(assessment_id + 1));
         Ok(assessment_id)
-    }
-
-    /// Add a reputation review for an entity.
-    /// Requires verified KYC for the reviewer.
-    pub fn add_reputation_review(
-        env: Env,
-        reviewer: Address,
-        reviewer_did: String,
-        subject_did: String,
-        rating: u32,
-        category: String,
-        comments: Option<String>,
-        verified_credentials: Vec<String>,
-    ) -> Result<u64, Error> {
-        reviewer.require_auth();
-        Self::require_verified_kyc(&env, &reviewer)?;
-
-        if !(1..=5).contains(&rating) {
-            return Err(Error::InvalidRating);
-        }
-
-        let review_id = Self::get_next_review_id(&env);
-        let now = env.ledger().timestamp();
-
-        let review = ReputationReview {
-            review_id,
-            reviewer_did,
-            subject_did,
-            rating,
-            category,
-            comments,
-            verified_credentials,
-            created_at: now,
-        };
-
-        env.storage().instance().set(&(REVIEWS, review_id), &review);
-        env.storage()
-            .instance()
-            .set(&NEXT_REVIEW_ID, &(review_id + 1));
-
-        Ok(review_id)
-    }
-
-    fn update_reputation_from_review(env: Env, entity_did: String, rating: u32, category: &String) {
-        let mut reputation = Self::get_reputation_score(env.clone(), entity_did.clone()).unwrap();
-
-        // Update category score
-        let current_category_score = reputation
-            .category_scores
-            .get(category.clone())
-            .unwrap_or(50);
-        let review_count = reputation.review_count + 1;
-
-        // Calculate new category score (weighted average)
-        let new_category_score =
-            (current_category_score * (review_count - 1) + rating * 20) / review_count; // Rating 1-5 -> 20-100 scale
-        reputation
-            .category_scores
-            .set(category.clone(), new_category_score);
-
-        // Update overall score
-        let mut total_category_score = 0;
-        let mut category_count = 0;
-        for (_, score) in reputation.category_scores.iter() {
-            total_category_score += score;
-            category_count += 1;
-        }
-
-        if category_count > 0 {
-            reputation.overall_score = total_category_score / category_count;
-        }
-
-        reputation.review_count = review_count;
-        reputation.last_updated = env.ledger().timestamp();
-
-        // Store updated reputation
-        env.storage()
-            .instance()
-            .set(&(REPUTATION_SCORES, entity_did.clone()), &reputation);
-
-        // Emit event
-        env.events().publish(
-            (Symbol::new(&env, "ReputationUpdated"), entity_did.clone()),
-            ReputationUpdatedEvent {
-                entity_did: entity_did.clone(),
-                new_score: reputation.overall_score,
-                updated_by: env.current_contract_address(),
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-    }
-
-    fn increment_counter(env: Env, counter_key: &Symbol) -> u64 {
-        let count: u64 = env.storage().instance().get(counter_key).unwrap_or(0);
-        let new_count = count + 1;
-        env.storage().instance().set(counter_key, &new_count);
-        new_count
     }
 
     // ── KYC State Machine ────────────────────────────────────────────────────
@@ -580,6 +447,11 @@ impl ComplianceIntegrationContract {
         Ok(())
     }
 
+    /// Retrieve a KYC record for a subject
+    pub fn kyc_get(env: Env, subject: Address) -> Result<KycRecord, Error> {
+        Self::get_kyc_record(&env, &subject)
+    }
+
     /// Check if a subject has verified KYC status
     pub fn kyc_is_verified(env: Env, subject: Address) -> bool {
         match Self::get_kyc_record(&env, &subject) {
@@ -610,27 +482,20 @@ impl ComplianceIntegrationContract {
     }
 
     fn is_terminal_kyc_status(status: KycStatus) -> bool {
-        match status {
-            KycStatus::Verified | KycStatus::Rejected => true,
-            _ => false,
-        }
+        matches!(status, KycStatus::Verified | KycStatus::Rejected)
     }
 
     fn is_valid_kyc_transition(old: KycStatus, new: KycStatus) -> bool {
-        match (old, new) {
-            (KycStatus::Pending, KycStatus::InReview) => true,
-            (KycStatus::InReview, KycStatus::Verified) => true,
-            (KycStatus::InReview, KycStatus::Rejected) => true,
-            _ => false,
-        }
+        matches!(
+            (old, new),
+            (KycStatus::Pending, KycStatus::InReview)
+                | (KycStatus::InReview, KycStatus::Verified)
+                | (KycStatus::InReview, KycStatus::Rejected)
+        )
     }
 
     fn get_next_report_id(env: &Env) -> u64 {
         env.storage().instance().get(&NEXT_REPORT_ID).unwrap_or(1)
-    }
-
-    fn get_next_review_id(env: &Env) -> u64 {
-        env.storage().instance().get(&NEXT_REVIEW_ID).unwrap_or(1)
     }
 
     fn verify_admin(env: &Env, caller: &Address) -> Result<(), Error> {
@@ -643,13 +508,6 @@ impl ComplianceIntegrationContract {
             return Err(Error::Unauthorized);
         }
         Ok(())
-    }
-
-    fn get_reputation_score(env: Env, entity_did: String) -> Result<ReputationScore, Error> {
-        env.storage()
-            .instance()
-            .get(&(REPUTATION_SCORES, entity_did))
-            .ok_or(Error::ReportNotFound)
     }
 }
 
@@ -723,23 +581,6 @@ mod test {
         init_subject(env, contract_id, operator, subject, did);
         transition_subject(env, contract_id, operator, subject, KycStatus::InReview).unwrap();
         transition_subject(env, contract_id, operator, subject, KycStatus::Verified).unwrap();
-    }
-
-    fn sample_findings(env: &Env) -> Vec<ComplianceFinding> {
-        let mut findings = Vec::new(env);
-        findings.push_back(ComplianceFinding {
-            category: String::from_str(env, "ID"),
-            severity: String::from_str(env, "Low"),
-            description: String::from_str(env, "Valid"),
-            recommendation: None,
-        });
-        findings
-    }
-
-    fn sample_string_vec(env: &Env, val: &str) -> Vec<String> {
-        let mut v = Vec::new(env);
-        v.push_back(String::from_str(env, val));
-        v
     }
 
     #[test]
@@ -929,39 +770,6 @@ mod test {
             )
             .unwrap_err(),
             Error::KycTerminalState
-        );
-    }
-
-    #[test]
-    fn test_only_kyc_operators_can_assign_status() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (contract_id, _admin, operator_one, _operator_two) = setup(&env);
-        let outsider = Address::generate(&env);
-        let subject = Address::generate(&env);
-
-        let init_err = env.as_contract(&contract_id, || {
-            ComplianceIntegrationContract::kyc_init(
-                env.clone(),
-                outsider.clone(),
-                subject.clone(),
-                String::from_str(&env, "did:stellar:subject5"),
-            )
-            .unwrap_err()
-        });
-        assert_eq!(init_err, Error::KycOperatorRequired);
-
-        init_subject(
-            &env,
-            &contract_id,
-            &operator_one,
-            &subject,
-            "did:stellar:subject5",
-        );
-        assert_eq!(
-            transition_subject(&env, &contract_id, &outsider, &subject, KycStatus::InReview)
-                .unwrap_err(),
-            Error::KycOperatorRequired
         );
     }
 

@@ -216,12 +216,7 @@ pub mod testutils {
     use super::*;
     use soroban_sdk::Env;
 
-    pub fn create_oracle_data(
-        env: &Env,
-        key: &str,
-        value: &str,
-        source: &str,
-    ) -> OracleData {
+    pub fn create_oracle_data(env: &Env, key: &str, value: &str, source: &str) -> OracleData {
         OracleData {
             key: String::from_str(env, key),
             value: String::from_str(env, value),
@@ -243,10 +238,7 @@ pub mod testutils {
             agent_id,
             oracle_provider,
             new_model_hash: String::from_str(env, new_model_hash),
-            attestation_data: Bytes::from_slice(
-                env,
-                b"mock_attestation_data",
-            ),
+            attestation_data: Bytes::from_slice(env, b"mock_attestation_data"),
             signature: Bytes::from_slice(env, &[0u8; 64]),
             timestamp: env.ledger().timestamp(),
             nonce,
@@ -263,12 +255,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{Env, String};
 
-    fn key(
-        env: &Env,
-        module: ModuleId,
-        category: &str,
-        identifier: &str,
-    ) -> NamespacedKey {
+    fn key(env: &Env, module: ModuleId, category: &str, identifier: &str) -> NamespacedKey {
         NamespacedKey {
             module,
             category: String::from_str(env, category),
@@ -280,12 +267,7 @@ mod tests {
     fn valid_key_passes_validation() {
         let env = Env::default();
 
-        let k = key(
-            &env,
-            ModuleId::Marketplace,
-            "listing",
-            "123",
-        );
+        let k = key(&env, ModuleId::Marketplace, "listing", "123");
 
         assert!(k.validate());
     }
@@ -294,12 +276,7 @@ mod tests {
     fn empty_category_fails() {
         let env = Env::default();
 
-        let k = key(
-            &env,
-            ModuleId::Marketplace,
-            "",
-            "123",
-        );
+        let k = key(&env, ModuleId::Marketplace, "", "123");
 
         assert!(!k.validate());
     }
@@ -308,27 +285,16 @@ mod tests {
     fn empty_identifier_fails() {
         let env = Env::default();
 
-        let k = key(
-            &env,
-            ModuleId::Marketplace,
-            "listing",
-            "",
-        );
+        let k = key(&env, ModuleId::Marketplace, "listing", "");
 
         assert!(!k.validate());
     }
 
     #[test]
     fn modules_are_unique() {
-        assert_ne!(
-            ModuleId::Marketplace,
-            ModuleId::Evolution
-        );
+        assert_ne!(ModuleId::Marketplace, ModuleId::Evolution);
 
-        assert_ne!(
-            ModuleId::Marketplace,
-            ModuleId::AgentNft
-        );
+        assert_ne!(ModuleId::Marketplace, ModuleId::AgentNft);
     }
 
     #[test]
@@ -343,34 +309,16 @@ mod tests {
             ModuleId::Compliance,
         ];
 
-        let categories = [
-            "user",
-            "agent",
-            "listing",
-            "request",
-            "proposal",
-        ];
+        let categories = ["user", "agent", "listing", "request", "proposal"];
 
-        let identifiers = [
-            "1",
-            "2",
-            "100",
-            "999",
-            "dynamic_key",
-        ];
+        let identifiers = ["1", "2", "100", "999", "dynamic_key"];
 
-        let mut keys: Vec<(ModuleId, String, String)> =
-            Vec::new(&env);
+        let mut keys: Vec<(ModuleId, String, String)> = Vec::new(&env);
 
         for module in modules {
             for category in categories {
                 for identifier in identifiers {
-                    let k = key(
-                        &env,
-                        module,
-                        category,
-                        identifier,
-                    );
+                    let k = key(&env, module, category, identifier);
 
                     assert!(k.validate());
 
@@ -382,20 +330,14 @@ mod tests {
                         );
                     }
 
-                    keys.push_back((
-                        k.module,
-                        k.category,
-                        k.identifier,
-                    ));
+                    keys.push_back((k.module, k.category, k.identifier));
                 }
             }
         }
 
         assert_eq!(
             keys.len(),
-            (modules.len()
-                * categories.len()
-                * identifiers.len()) as u32
+            (modules.len() * categories.len() * identifiers.len()) as u32
         );
     }
 }

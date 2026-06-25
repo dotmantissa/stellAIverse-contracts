@@ -644,7 +644,8 @@ mod tests {
             env.storage()
                 .instance()
                 .set(&Symbol::new(&env, ADMIN_KEY), &admin);
-            assert!(validate_internal_call(&env, &admin, "test_function").is_ok());
+            let test_function = Symbol::new(&env, "test_function");
+            assert!(validate_internal_call(&env, &admin, &test_function).is_ok());
         });
     }
 

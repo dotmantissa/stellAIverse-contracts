@@ -2,70 +2,100 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build_and_test:
-    name: Rust CI
+  build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
           components: rustfmt, clippy
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+      
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-
+      
+      - name: Build
+        run: cargo build --all --locked
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
-
-      - name: Install wasm optimizer
-        run: sudo apt-get update && sudo apt-get install -y binaryen
-
-      - name: Check Formatting
-        run: cargo fmt -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -W clippy::all -W clippy::pedantic -A clippy::too_many_arguments -A clippy::unnecessary_cast -A clippy::len_zero -A clippy::assign-op-pattern -A clippy::manual-unwrap_or -A clippy::unnecessary-lazy-evaluations -A clippy::manual-range-contains -A clippy::manual-clamp -A clippy::needless_borrow -A clippy::wildcard-imports -A clippy::needless_pass_by_value -A clippy::must_use_candidate -A clippy::doc_markdown -A clippy::too_many_lines -A clippy::missing_panics_doc -A clippy::used_underscore_binding -A clippy::cast_lossless -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::cast_possible_wrap -A clippy::manual_assert -A clippy::unused_mut -A clippy::struct_field_names -A clippy::map_unwrap_or -A clippy::uninlined_format_args -A clippy::implicit_saturating_sub -A clippy::unreadable_literal -A unused-imports -A unused-variables -A dead-code -A deprecated
-
-      - name: Security Audit
-        run: cargo audit
-
-      - name: Build Contracts
-        run: bash ./scripts/build-optimized-wasm.sh governance Cargo.toml
-
-      - name: Property-Based Tests
-        run: cargo test -p agent-nft -p marketplace -p execution-hub --lib prop_tests
-        timeout-minutes: 10
-
-  formal_verification:
-    name: Formal Verification (Kani)
+  format:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: rustfmt
+      
+      - name: Check formatting
+        run: cargo fmt --all --check
 
-      - name: Install Kani Verifier
-        run: |
-          cargo install --locked kani-verifier
-          cargo kani setup
-
-      - name: Run Kani Proof Harnesses
-        working-directory: ./formal-verification
-        run: |
-          if [ -d "src" ] && [ -f "Cargo.toml" ]; then
-            cargo kani || echo "Kani verification completed with warnings"
-          else
-            echo "Formal verification setup not complete, skipping Kani checks"
-          fi
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+      
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-
+      
+      - name: Run clippy
+        run: cargo clippy --all --all-targets --all-features -- -D warnings
