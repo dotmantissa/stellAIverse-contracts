@@ -92,7 +92,11 @@ impl ExecutionHub {
         Self::validate_string(&rule_name);
         Self::validate_data(&rule_data);
 
-        let key = (String::from_str(&env, RULE_PREFIX), agent_id, rule_name.clone());
+        let key = (
+            String::from_str(&env, RULE_PREFIX),
+            agent_id,
+            rule_name.clone(),
+        );
         env.storage().instance().set(&key, &rule_data);
         env.events().publish(
             (symbol_short!("rule_reg"),),
@@ -103,7 +107,11 @@ impl ExecutionHub {
     pub fn revoke_rule(env: Env, agent_id: u64, owner: Address, rule_name: String) {
         owner.require_auth();
         Self::validate_agent_id(agent_id);
-        let key = (String::from_str(&env, RULE_PREFIX), agent_id, rule_name.clone());
+        let key = (
+            String::from_str(&env, RULE_PREFIX),
+            agent_id,
+            rule_name.clone(),
+        );
         env.storage().instance().remove(&key);
         env.events()
             .publish((symbol_short!("rule_rev"),), (agent_id, rule_name, owner));
@@ -137,7 +145,12 @@ impl ExecutionHub {
             panic!("Invalid nonce: replay protection triggered");
         }
 
-        Self::check_rate_limit(&env, agent_id, DEFAULT_RATE_LIMIT_OPS, DEFAULT_RATE_LIMIT_WINDOW);
+        Self::check_rate_limit(
+            &env,
+            agent_id,
+            DEFAULT_RATE_LIMIT_OPS,
+            DEFAULT_RATE_LIMIT_WINDOW,
+        );
 
         let exec_id = Self::next_exec_id(&env);
         Self::set_nonce_inner(&env, agent_id, nonce);
@@ -145,7 +158,14 @@ impl ExecutionHub {
 
         env.events().publish(
             (symbol_short!("act_exec"),),
-            (exec_id, agent_id, action, executor, env.ledger().timestamp(), nonce),
+            (
+                exec_id,
+                agent_id,
+                action,
+                executor,
+                env.ledger().timestamp(),
+                nonce,
+            ),
         );
         exec_id
     }
@@ -163,7 +183,11 @@ impl ExecutionHub {
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut result = Vec::new(&env);
-        let start = if history.len() > limit { history.len() - limit } else { 0 };
+        let start = if history.len() > limit {
+            history.len() - limit
+        } else {
+            0
+        };
         for i in start..history.len() {
             if let Some(item) = history.get(i) {
                 result.push_back(item);
@@ -296,10 +320,14 @@ impl ExecutionHub {
             step.updated_at = now;
             step.error = None;
             wf.steps.set(step_index, step.clone());
-            wf.completed_steps =
-                wf.completed_steps.checked_add(1).expect("completed_steps overflow");
-            wf.current_step =
-                wf.current_step.checked_add(1).expect("current_step overflow");
+            wf.completed_steps = wf
+                .completed_steps
+                .checked_add(1)
+                .expect("completed_steps overflow");
+            wf.current_step = wf
+                .current_step
+                .checked_add(1)
+                .expect("current_step overflow");
             wf.updated_at = now;
 
             env.events().publish(
@@ -313,16 +341,20 @@ impl ExecutionHub {
                 Self::save_workflow(&env, &wf);
                 Self::maybe_fire_callback(&env, &mut wf);
                 Self::save_workflow(&env, &wf);
-                env.events()
-                    .publish((symbol_short!("wf_done"),), (workflow_id, wf.completed_steps, now));
+                env.events().publish(
+                    (symbol_short!("wf_done"),),
+                    (workflow_id, wf.completed_steps, now),
+                );
             } else {
                 Self::save_workflow(&env, &wf);
             }
 
             WorkflowStepStatus::Completed
         } else if step.retry_count < step.max_retries {
-            step.retry_count =
-                step.retry_count.checked_add(1).expect("retry_count overflow");
+            step.retry_count = step
+                .retry_count
+                .checked_add(1)
+                .expect("retry_count overflow");
             step.status = WorkflowStepStatus::Pending;
             step.error = Some(String::from_str(&env, "Transient failure; will retry"));
             step.updated_at = now;
@@ -337,8 +369,7 @@ impl ExecutionHub {
             step.error = Some(String::from_str(&env, "Step failed after all retries"));
             step.updated_at = now;
             wf.steps.set(step_index, step);
-            wf.failure_reason =
-                Some(String::from_str(&env, "Required step failed"));
+            wf.failure_reason = Some(String::from_str(&env, "Required step failed"));
             wf.updated_at = now;
             Self::save_workflow(&env, &wf);
 
@@ -357,8 +388,10 @@ impl ExecutionHub {
             step.error = Some(String::from_str(&env, "Optional step failed; skipped"));
             step.updated_at = now;
             wf.steps.set(step_index, step);
-            wf.current_step =
-                wf.current_step.checked_add(1).expect("current_step overflow");
+            wf.current_step = wf
+                .current_step
+                .checked_add(1)
+                .expect("current_step overflow");
             wf.updated_at = now;
             Self::save_workflow(&env, &wf);
             env.events()
@@ -479,7 +512,10 @@ impl ExecutionHub {
 
     fn load_workflow(env: &Env, workflow_id: u64) -> WorkflowInstance {
         let key = Self::workflow_key(env, workflow_id);
-        env.storage().instance().get(&key).expect("Workflow not found")
+        env.storage()
+            .instance()
+            .get(&key)
+            .expect("Workflow not found")
     }
 
     fn save_workflow(env: &Env, wf: &WorkflowInstance) {
@@ -568,12 +604,14 @@ impl ExecutionHub {
             step.status = WorkflowStepStatus::RolledBack;
             step.updated_at = now;
             wf.steps.set(i, step);
-            wf.rolled_back_steps =
-                wf.rolled_back_steps.checked_add(1).expect("rolled_back_steps overflow");
+            wf.rolled_back_steps = wf
+                .rolled_back_steps
+                .checked_add(1)
+                .expect("rolled_back_steps overflow");
             wf.updated_at = now;
 
             env.events()
-                .publish((symbol_short!("wf_rb"),), (wf.workflow_id, i as u32, now));
+                .publish((symbol_short!("wf_rb"),), (wf.workflow_id, i, now));
         }
 
         // Determine terminal status
@@ -685,9 +723,13 @@ impl ExecutionHub {
         } else {
             panic!("Rate limit exceeded");
         };
-        env.storage()
-            .instance()
-            .set(&key, &RateLimitData { last_reset: new_reset, count: new_count });
+        env.storage().instance().set(
+            &key,
+            &RateLimitData {
+                last_reset: new_reset,
+                count: new_count,
+            },
+        );
     }
 
     // =========================================================================
@@ -746,7 +788,13 @@ mod tests {
         (env, contract_id, admin)
     }
 
-    fn make_step(env: &Env, idx: u32, target: &Address, fn_name: &str, required: bool) -> WorkflowStep {
+    fn make_step(
+        env: &Env,
+        idx: u32,
+        target: &Address,
+        fn_name: &str,
+        required: bool,
+    ) -> WorkflowStep {
         WorkflowStep {
             step_index: idx,
             name: String::from_str(env, fn_name),
@@ -900,8 +948,22 @@ mod tests {
         let mut steps = Vec::new(&env);
         steps.push_back(make_step(&env, 0, &target, "noop", true));
 
-        client.create_workflow(&initiator, &String::from_str(&env, "wf_a"), &steps, &None, &None, &None);
-        client.create_workflow(&initiator, &String::from_str(&env, "wf_b"), &steps, &None, &None, &None);
+        client.create_workflow(
+            &initiator,
+            &String::from_str(&env, "wf_a"),
+            &steps,
+            &None,
+            &None,
+            &None,
+        );
+        client.create_workflow(
+            &initiator,
+            &String::from_str(&env, "wf_b"),
+            &steps,
+            &None,
+            &None,
+            &None,
+        );
 
         let history = client.get_workflow_history(&initiator);
         assert_eq!(history.len(), 2u32);
