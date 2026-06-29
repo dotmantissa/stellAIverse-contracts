@@ -37,6 +37,11 @@ pub enum ContractError {
     SameAddressTransfer = 36,
     NotFound = 37,
     AlreadyExists = 38,
+    // AMM integration errors (Issue #245)
+    AmmNotConfigured = 50,
+    TokenNotAccepted = 51,
+    InsufficientSwapOutput = 52,
+    SwapFailed = 53,
 }
 
 pub fn error_description(error: ContractError) -> &'static str {
@@ -72,5 +77,9 @@ pub fn error_description(error: ContractError) -> &'static str {
         ContractError::SameAddressTransfer => "Transfer to same address",
         ContractError::NotFound => "Resource not found",
         ContractError::AlreadyExists => "Resource already exists",
+        ContractError::AmmNotConfigured => "AMM contract not configured",
+        ContractError::TokenNotAccepted => "Payment token not in accepted list",
+        ContractError::InsufficientSwapOutput => "AMM swap output below required amount",
+        ContractError::SwapFailed => "AMM swap failed",
     }
 }
